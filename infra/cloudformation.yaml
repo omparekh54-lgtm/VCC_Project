@@ -1,341 +1,560 @@
-AWSTemplateFormatVersion: "2010-09-09"
-Description: >
-  Infra Watchdog - persistent infrastructure (S3 data store, EC2 Auto Scaling
-  group running the FastAPI app, and the Lambda scaling guardrail on an
-  EventBridge schedule). SageMaker training/endpoint resources are created
-  separately via ml/launch_training_job.py and ml/deploy_endpoint.py, since
-  they depend on a model artifact that doesn't exist yet at infra-deploy time.
-
-Parameters:
-  VpcId:
-    Type: AWS::EC2::VPC::Id
-    Description: VPC to launch the app instance(s) into (your default VPC works fine).
-  SubnetIds:
-    Type: List<AWS::EC2::Subnet::Id>
-    Description: Public subnet(s) in that VPC (the instance needs a public IP).
-  InstanceType:
-    Type: String
-    Default: t3.medium
-  MaxCapacity:
-    Type: Number
-    Default: 4
-    Description: Ceiling the scaling guardrail is allowed to scale the app fleet to.
-  LatencyThresholdMs:
-    Type: Number
-    Default: 500
-    Description: Predicted response_time_ms above which the Lambda scales out.
-  SageMakerEndpointName:
-    Type: String
-    Default: infra-watchdog-endpoint
-    Description: Name you will give the SageMaker endpoint in ml/deploy_endpoint.py.
-  AppPort:
-    Type: Number
-    Default: 8000
-
-Resources:
-  # ---------------------------------------------------------------------
-  # S3 - training-data / model-artifact store, and where the app code lives
-  # ---------------------------------------------------------------------
-  MetricsBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: !Sub "infra-watchdog-metrics-${AWS::AccountId}-${AWS::Region}"
-      VersioningConfiguration:
-        Status: Enabled
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
-
-  # ---------------------------------------------------------------------
-  # EC2 - runs the FastAPI app, in an Auto Scaling group so the Lambda has
-  # something to scale. No load balancer (kept to exactly 4 AWS services),
-  # so the Lambda discovers the live instance itself via the ASG + EC2 APIs.
-  # ---------------------------------------------------------------------
-  EC2InstanceRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal: { Service: ec2.amazonaws.com }
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore # lets you connect via Session Manager, no SSH key needed
-      Policies:
-        - PolicyName: MetricsBucketAccess
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action: [s3:GetObject]
-                Resource: !Sub "arn:aws:s3:::${MetricsBucket}/app/*"
-              - Effect: Allow
-                Action: [s3:PutObject, s3:GetObject]
-                Resource: !Sub "arn:aws:s3:::${MetricsBucket}/data/*"
-
-  EC2InstanceProfile:
-    Type: AWS::IAM::InstanceProfile
-    Properties:
-      Roles: [!Ref EC2InstanceRole]
-
-  AppSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Infra Watchdog app - inbound app port only, no SSH (use SSM)
-      VpcId: !Ref VpcId
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: !Ref AppPort
-          ToPort: !Ref AppPort
-          CidrIp: 0.0.0.0/0
-          Description: >-
-            Open for the demo so Locust and the Lambda (which runs outside
-            this VPC) can both reach /metrics. For production, run the Lambda
-            inside this VPC and restrict this to its security group instead.
-
-  LaunchTemplate:
-    Type: AWS::EC2::LaunchTemplate
-    Properties:
-      LaunchTemplateName: infra-watchdog-app
-      LaunchTemplateData:
-        InstanceType: !Ref InstanceType
-        ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
-        IamInstanceProfile:
-          Name: !Ref EC2InstanceProfile
-        SecurityGroupIds: [!Ref AppSecurityGroup]
-        UserData:
-          Fn::Base64:
-            !Sub |
-              #!/bin/bash
-              set -euo pipefail
-              (dnf install -y python3-pip awscli || yum install -y python3-pip awscli)
-
-              mkdir -p /opt/infra-watchdog
-              cd /opt/infra-watchdog
-              aws s3 cp s3://${MetricsBucket}/app/app.py .
-              aws s3 cp s3://${MetricsBucket}/app/requirements.txt .
-              pip3 install -r requirements.txt
-
-              cat > /etc/systemd/system/infra-watchdog.service << 'EOF'
-              [Unit]
-              Description=Infra Watchdog FastAPI backend
-              After=network.target
-
-              [Service]
-              WorkingDirectory=/opt/infra-watchdog
-              ExecStart=/usr/local/bin/uvicorn app:app --host 0.0.0.0 --port ${AppPort}
-              Restart=always
-              RestartSec=5
-
-              [Install]
-              WantedBy=multi-user.target
-              EOF
-
-              systemctl daemon-reload
-              systemctl enable --now infra-watchdog.service
-
-  AutoScalingGroup:
-    Type: AWS::AutoScaling::AutoScalingGroup
-    Properties:
-      AutoScalingGroupName: infra-watchdog-app-asg
-      MinSize: "0"
-      MaxSize: !Ref MaxCapacity
-      DesiredCapacity: "0" # stays 0 until you've uploaded app.py to the bucket - see README
-      VPCZoneIdentifier: !Ref SubnetIds
-      LaunchTemplate:
-        LaunchTemplateId: !Ref LaunchTemplate
-        Version: !GetAtt LaunchTemplate.LatestVersionNumber
-      Tags:
-        - Key: Name
-          Value: infra-watchdog-app
-          PropagateAtLaunch: true
-
-  # ---------------------------------------------------------------------
-  # SageMaker execution role (the endpoint/training job itself is created
-  # later by ml/launch_training_job.py and ml/deploy_endpoint.py)
-  # ---------------------------------------------------------------------
-  SageMakerExecutionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal: { Service: sagemaker.amazonaws.com }
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
-      Policies:
-        - PolicyName: MetricsBucketAccess
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action: [s3:GetObject, s3:PutObject, s3:ListBucket]
-                Resource:
-                  - !Sub "arn:aws:s3:::${MetricsBucket}"
-                  - !Sub "arn:aws:s3:::${MetricsBucket}/*"
-
-  # ---------------------------------------------------------------------
-  # Lambda - the scaling guardrail
-  # ---------------------------------------------------------------------
-  LambdaExecutionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal: { Service: lambda.amazonaws.com }
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: ScalingGuardrailPermissions
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action: sagemaker:InvokeEndpoint
-                Resource: !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/*"
-              - Effect: Allow
-                Action:
-                  - autoscaling:DescribeAutoScalingGroups
-                  - autoscaling:SetDesiredCapacity
-                  - ec2:DescribeInstances
-                  - cloudwatch:PutMetricData
-                Resource: "*" # these actions don't support resource-level restriction
-
-  ScalingGuardrailFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: infra-watchdog-scaling-guardrail
-      Runtime: python3.12
-      Handler: lambda_function.lambda_handler
-      Timeout: 55
-      MemorySize: 128
-      Role: !GetAtt LambdaExecutionRole.Arn
-      Environment:
-        Variables:
-          SAGEMAKER_ENDPOINT_NAME: !Ref SageMakerEndpointName
-          ASG_NAME: !Ref AutoScalingGroup
-          APP_PORT: !Ref AppPort
-          LATENCY_THRESHOLD_MS: !Ref LatencyThresholdMs
-          MAX_SCALE_STEP: "1"
-      Code:
-        # Inlined here so the stack is deployable in one shot (no external
-        # deps beyond boto3, which ships with the Lambda runtime). This is a
-        # mirror of lambda/lambda_function.py - that file is the source of
-        # truth; if you change the logic, update it there and paste it back
-        # in here (or switch to `aws lambda update-function-code` with a
-        # zipped package once you're iterating on it directly).
-        ZipFile: |
-          import json
-          import os
-          import time
-          import urllib.request
-
-          import boto3
-
-          SAGEMAKER_ENDPOINT_NAME = os.environ["SAGEMAKER_ENDPOINT_NAME"]
-          ASG_NAME = os.environ["ASG_NAME"]
-          APP_PORT = os.environ.get("APP_PORT", "8000")
-          LATENCY_THRESHOLD_MS = float(os.environ.get("LATENCY_THRESHOLD_MS", "500"))
-          MAX_SCALE_STEP = int(os.environ.get("MAX_SCALE_STEP", "1"))
-
-          sagemaker_runtime = boto3.client("sagemaker-runtime")
-          autoscaling = boto3.client("autoscaling")
-          ec2 = boto3.client("ec2")
-          cloudwatch = boto3.client("cloudwatch")
-
-
-          def get_app_instance_ip():
-              asg = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[ASG_NAME])["AutoScalingGroups"][0]
-              instance_ids = [i["InstanceId"] for i in asg["Instances"] if i["LifecycleState"] == "InService"]
-              if not instance_ids:
-                  raise RuntimeError(f"No InService instances in ASG {ASG_NAME}")
-              reservations = ec2.describe_instances(InstanceIds=instance_ids[:1])["Reservations"]
-              ip = reservations[0]["Instances"][0].get("PublicIpAddress")
-              if not ip:
-                  raise RuntimeError("App instance has no public IP yet (still booting?)")
-              return ip
-
-
-          def fetch_metrics():
-              ip = get_app_instance_ip()
-              with urllib.request.urlopen(f"http://{ip}:{APP_PORT}/metrics", timeout=5) as resp:
-                  return json.loads(resp.read().decode())
-
-
-          def predict_latency(metrics):
-              payload = json.dumps({k: metrics[k] for k in ("cpu_usage", "active_connections", "lag_ms")})
-              response = sagemaker_runtime.invoke_endpoint(
-                  EndpointName=SAGEMAKER_ENDPOINT_NAME, ContentType="application/json", Body=payload
-              )
-              result = json.loads(response["Body"].read().decode())
-              return result["predicted_response_time_ms"][0]
-
-
-          def maybe_scale_out(predicted_latency_ms):
-              cloudwatch.put_metric_data(
-                  Namespace="InfraWatchdog",
-                  MetricData=[{"MetricName": "PredictedLatencyMs", "Value": predicted_latency_ms, "Unit": "Milliseconds"}],
-              )
-              if predicted_latency_ms <= LATENCY_THRESHOLD_MS:
-                  return "ok"
-              group = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[ASG_NAME])["AutoScalingGroups"][0]
-              current, max_cap = group["DesiredCapacity"], group["MaxSize"]
-              new_capacity = min(current + MAX_SCALE_STEP, max_cap)
-              if new_capacity > current:
-                  autoscaling.set_desired_capacity(AutoScalingGroupName=ASG_NAME, DesiredCapacity=new_capacity, HonorCooldown=True)
-                  return f"scaled {current} -> {new_capacity}"
-              return "already at max capacity"
-
-
-          def run_check():
-              metrics = fetch_metrics()
-              predicted = predict_latency(metrics)
-              outcome = maybe_scale_out(predicted)
-              print(f"metrics={metrics} predicted_latency_ms={predicted:.1f} outcome={outcome}")
-              return predicted, outcome
-
-
-          def lambda_handler(event, context):
-              results = [run_check()]
-              time.sleep(30)
-              results.append(run_check())
-              return {"checks": [{"predicted_latency_ms": p, "outcome": o} for p, o in results]}
-
-  SchedulerRule:
-    Type: AWS::Events::Rule
-    Properties:
-      Name: infra-watchdog-schedule
-      Description: Invokes the scaling guardrail roughly once a minute (see lambda cadence note)
-      ScheduleExpression: rate(1 minute)
-      State: DISABLED # enable once the app, model, and endpoint are all live - see README
-      Targets:
-        - Arn: !GetAtt ScalingGuardrailFunction.Arn
-          Id: ScalingGuardrailTarget
-
-  SchedulerPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref ScalingGuardrailFunction
-      Action: lambda:InvokeFunction
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt SchedulerRule.Arn
-
-Outputs:
-  MetricsBucketName:
-    Value: !Ref MetricsBucket
-  AutoScalingGroupName:
-    Value: !Ref AutoScalingGroup
-  SageMakerExecutionRoleArn:
-    Value: !GetAtt SageMakerExecutionRole.Arn
-  ScalingGuardrailFunctionName:
-    Value: !Ref ScalingGuardrailFunction
-  SchedulerRuleName:
-    Value: !Ref SchedulerRule
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Infra Watchdog - persistent infrastructure (S3 data store, EC2 Auto Scaling group running the FastAPI app, and the Lambda scaling guardrail on an EventBridge schedule). SageMaker training/endpoint resources are created separately via ml/launch_training_job.py and ml/deploy_endpoint.py, since they depend on a model artifact that doesn't exist yet at infra-deploy time.\n",
+  "Parameters": {
+    "VpcId": {
+      "Type": "AWS::EC2::VPC::Id",
+      "Description": "VPC to launch the app instance(s) into (your default VPC works fine)."
+    },
+    "SubnetIds": {
+      "Type": "List<AWS::EC2::Subnet::Id>",
+      "Description": "Public subnet(s) in that VPC (the instance needs a public IP)."
+    },
+    "InstanceType": {
+      "Type": "String",
+      "Default": "t3.medium"
+    },
+    "MaxCapacity": {
+      "Type": "Number",
+      "Default": 1,
+      "Description": "Ceiling the scaling guardrail is allowed to scale the app fleet to.",
+      "MaxValue": 1
+    },
+    "LatencyThresholdMs": {
+      "Type": "Number",
+      "Default": 500,
+      "Description": "Predicted response_time_ms above which the Lambda scales out."
+    },
+    "SageMakerEndpointName": {
+      "Type": "String",
+      "Default": "infra-watchdog-endpoint",
+      "Description": "Name you will give the SageMaker endpoint in ml/deploy_endpoint.py."
+    },
+    "AppPort": {
+      "Type": "Number",
+      "Default": 8000
+    }
+  },
+  "Resources": {
+    "MetricsBucket": {
+      "Type": "AWS::S3::Bucket",
+      "Properties": {
+        "BucketName": {
+          "Fn::Sub": "infra-watchdog-metrics-${AWS::AccountId}-${AWS::Region}"
+        },
+        "VersioningConfiguration": {
+          "Status": "Enabled"
+        },
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "BlockPublicPolicy": true,
+          "IgnorePublicAcls": true,
+          "RestrictPublicBuckets": true
+        },
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "AES256"
+              }
+            }
+          ]
+        }
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "EC2InstanceRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ec2.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+        ],
+        "Policies": [
+          {
+            "PolicyName": "MetricsBucketAccess",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:GetObject"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:s3:::${MetricsBucket}/app/*"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:PutObject",
+                    "s3:GetObject"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:s3:::${MetricsBucket}/data/*"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:GetObject",
+                    "s3:PutObject"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:s3:::${MetricsBucket}/ml/*"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "EC2InstanceProfile": {
+      "Type": "AWS::IAM::InstanceProfile",
+      "Properties": {
+        "Roles": [
+          {
+            "Ref": "EC2InstanceRole"
+          }
+        ]
+      }
+    },
+    "AppSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Infra Watchdog app - inbound app port only, no SSH (use SSM)",
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": {
+              "Ref": "AppPort"
+            },
+            "ToPort": {
+              "Ref": "AppPort"
+            },
+            "CidrIp": "0.0.0.0/0",
+            "Description": "Open for the demo so Locust and the Lambda (which runs outside this VPC) can both reach /metrics. For production, run the Lambda inside this VPC and restrict this to its security group instead."
+          }
+        ]
+      }
+    },
+    "LaunchTemplate": {
+      "Type": "AWS::EC2::LaunchTemplate",
+      "Properties": {
+        "LaunchTemplateName": "infra-watchdog-app",
+        "LaunchTemplateData": {
+          "InstanceType": {
+            "Ref": "InstanceType"
+          },
+          "ImageId": "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}",
+          "IamInstanceProfile": {
+            "Name": {
+              "Ref": "EC2InstanceProfile"
+            }
+          },
+          "SecurityGroupIds": [
+            {
+              "Ref": "AppSecurityGroup"
+            }
+          ],
+          "UserData": {
+            "Fn::Base64": {
+              "Fn::Sub": "#!/bin/bash\nset -euo pipefail\n(dnf install -y python3-pip awscli || yum install -y python3-pip awscli)\n\nmkdir -p /opt/infra-watchdog\ncd /opt/infra-watchdog\naws s3 cp s3://${MetricsBucket}/app/app.py .\naws s3 cp s3://${MetricsBucket}/app/requirements.txt .\npython3 -m venv /opt/infra-watchdog/venv\n/opt/infra-watchdog/venv/bin/pip install -r requirements.txt\n\ncat > /etc/systemd/system/infra-watchdog.service << 'EOF'\n[Unit]\nDescription=Infra Watchdog FastAPI backend\nAfter=network.target\n\n[Service]\nWorkingDirectory=/opt/infra-watchdog\nExecStart=/opt/infra-watchdog/venv/bin/uvicorn app:app --host 0.0.0.0 --port ${AppPort}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\nEOF\n\nsystemctl daemon-reload\nsystemctl enable --now infra-watchdog.service\n"
+            }
+          },
+          "MetadataOptions": {
+            "HttpTokens": "required",
+            "HttpEndpoint": "enabled"
+          },
+          "CreditSpecification": {
+            "CpuCredits": "standard"
+          }
+        }
+      }
+    },
+    "AutoScalingGroup": {
+      "Type": "AWS::AutoScaling::AutoScalingGroup",
+      "Properties": {
+        "AutoScalingGroupName": "infra-watchdog-app-asg",
+        "MinSize": "0",
+        "MaxSize": {
+          "Ref": "MaxCapacity"
+        },
+        "DesiredCapacity": "0",
+        "VPCZoneIdentifier": {
+          "Ref": "SubnetIds"
+        },
+        "LaunchTemplate": {
+          "LaunchTemplateId": {
+            "Ref": "LaunchTemplate"
+          },
+          "Version": {
+            "Fn::GetAtt": [
+              "LaunchTemplate",
+              "LatestVersionNumber"
+            ]
+          }
+        },
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "infra-watchdog-app",
+            "PropagateAtLaunch": true
+          }
+        ]
+      }
+    },
+    "SageMakerExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "sagemaker.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/AmazonSageMakerFullAccess"
+        ],
+        "Policies": [
+          {
+            "PolicyName": "MetricsBucketAccess",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:GetObject",
+                    "s3:PutObject",
+                    "s3:ListBucket"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:aws:s3:::${MetricsBucket}"
+                    },
+                    {
+                      "Fn::Sub": "arn:aws:s3:::${MetricsBucket}/*"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "LambdaExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        ],
+        "Policies": [
+          {
+            "PolicyName": "ScalingGuardrailPermissions",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "sagemaker:InvokeEndpoint",
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/*"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "autoscaling:DescribeAutoScalingGroups",
+                    "autoscaling:SetDesiredCapacity",
+                    "ec2:DescribeInstances",
+                    "cloudwatch:PutMetricData"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "ScalingGuardrailFunction": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": "infra-watchdog-scaling-guardrail",
+        "Runtime": "python3.12",
+        "Handler": "index.lambda_handler",
+        "Timeout": 90,
+        "MemorySize": 128,
+        "Role": {
+          "Fn::GetAtt": [
+            "LambdaExecutionRole",
+            "Arn"
+          ]
+        },
+        "Environment": {
+          "Variables": {
+            "SAGEMAKER_ENDPOINT_NAME": {
+              "Ref": "SageMakerEndpointName"
+            },
+            "ASG_NAME": {
+              "Ref": "AutoScalingGroup"
+            },
+            "APP_PORT": {
+              "Ref": "AppPort"
+            },
+            "LATENCY_THRESHOLD_MS": {
+              "Ref": "LatencyThresholdMs"
+            },
+            "MAX_SCALE_STEP": "1"
+          }
+        },
+        "Code": {
+          "ZipFile": "import json\nimport os\nimport time\nimport urllib.request\n\nimport boto3\n\nSAGEMAKER_ENDPOINT_NAME = os.environ[\"SAGEMAKER_ENDPOINT_NAME\"]\nASG_NAME = os.environ[\"ASG_NAME\"]\nAPP_PORT = os.environ.get(\"APP_PORT\", \"8000\")\nLATENCY_THRESHOLD_MS = float(os.environ.get(\"LATENCY_THRESHOLD_MS\", \"500\"))\nMAX_SCALE_STEP = int(os.environ.get(\"MAX_SCALE_STEP\", \"1\"))\n\nsagemaker_runtime = boto3.client(\"sagemaker-runtime\")\nautoscaling = boto3.client(\"autoscaling\")\nec2 = boto3.client(\"ec2\")\ncloudwatch = boto3.client(\"cloudwatch\")\n\n\ndef get_app_instance_ip():\n    asg = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[ASG_NAME])[\"AutoScalingGroups\"][0]\n    instance_ids = [i[\"InstanceId\"] for i in asg[\"Instances\"] if i[\"LifecycleState\"] == \"InService\"]\n    if not instance_ids:\n        raise RuntimeError(f\"No InService instances in ASG {ASG_NAME}\")\n    reservations = ec2.describe_instances(InstanceIds=instance_ids[:1])[\"Reservations\"]\n    ip = reservations[0][\"Instances\"][0].get(\"PublicIpAddress\")\n    if not ip:\n        raise RuntimeError(\"App instance has no public IP yet (still booting?)\")\n    return ip\n\n\ndef fetch_metrics():\n    ip = get_app_instance_ip()\n    with urllib.request.urlopen(f\"http://{ip}:{APP_PORT}/metrics\", timeout=5) as resp:\n        return json.loads(resp.read().decode())\n\n\ndef predict_latency(metrics):\n    payload = json.dumps({k: metrics[k] for k in (\"cpu_usage\", \"active_connections\", \"lag_ms\")})\n    response = sagemaker_runtime.invoke_endpoint(\n        EndpointName=SAGEMAKER_ENDPOINT_NAME, ContentType=\"application/json\", Body=payload\n    )\n    result = json.loads(response[\"Body\"].read().decode())\n    return result[\"predicted_response_time_ms\"][0]\n\n\ndef maybe_scale_out(predicted_latency_ms):\n    cloudwatch.put_metric_data(\n        Namespace=\"InfraWatchdog\",\n        MetricData=[{\"MetricName\": \"PredictedLatencyMs\", \"Value\": predicted_latency_ms, \"Unit\": \"Milliseconds\"}],\n    )\n    if predicted_latency_ms <= LATENCY_THRESHOLD_MS:\n        return \"ok\"\n    group = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[ASG_NAME])[\"AutoScalingGroups\"][0]\n    current, max_cap = group[\"DesiredCapacity\"], group[\"MaxSize\"]\n    new_capacity = min(current + MAX_SCALE_STEP, max_cap)\n    if new_capacity > current:\n        autoscaling.set_desired_capacity(AutoScalingGroupName=ASG_NAME, DesiredCapacity=new_capacity, HonorCooldown=True)\n        return f\"scaled {current} -> {new_capacity}\"\n    return \"already at max capacity\"\n\n\ndef run_check():\n    metrics = fetch_metrics()\n    predicted = predict_latency(metrics)\n    outcome = maybe_scale_out(predicted)\n    print(f\"metrics={metrics} predicted_latency_ms={predicted:.1f} outcome={outcome}\")\n    return predicted, outcome\n\n\ndef lambda_handler(event, context):\n    results = [run_check()]\n    time.sleep(30)\n    results.append(run_check())\n    return {\"checks\": [{\"predicted_latency_ms\": p, \"outcome\": o} for p, o in results]}\n"
+        }
+      }
+    },
+    "SchedulerRule": {
+      "Type": "AWS::Events::Rule",
+      "Properties": {
+        "Name": "infra-watchdog-schedule",
+        "Description": "Invokes the scaling guardrail roughly once a minute (see lambda cadence note)",
+        "ScheduleExpression": "rate(1 minute)",
+        "State": "DISABLED",
+        "Targets": [
+          {
+            "Arn": {
+              "Fn::GetAtt": [
+                "ScalingGuardrailFunction",
+                "Arn"
+              ]
+            },
+            "Id": "ScalingGuardrailTarget"
+          }
+        ]
+      }
+    },
+    "SchedulerPermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "ScalingGuardrailFunction"
+        },
+        "Action": "lambda:InvokeFunction",
+        "Principal": "events.amazonaws.com",
+        "SourceArn": {
+          "Fn::GetAtt": [
+            "SchedulerRule",
+            "Arn"
+          ]
+        }
+      }
+    },
+    "CostGuardRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        ],
+        "Policies": [
+          {
+            "PolicyName": "StopDemoCompute",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "freetier:GetAccountPlanState",
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "events:DisableRule",
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "SchedulerRule",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "autoscaling:UpdateAutoScalingGroup",
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/infra-watchdog-app-asg"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "sagemaker:DeleteEndpoint",
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/infra-watchdog-endpoint"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "sagemaker:ListTrainingJobs",
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "sagemaker:StopTrainingJob",
+                  "Resource": {
+                    "Fn::Sub": "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:training-job/infra-watchdog*"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "CostGuardFunction": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": "infra-watchdog-cost-guard",
+        "Runtime": "python3.12",
+        "Handler": "index.lambda_handler",
+        "Timeout": 60,
+        "MemorySize": 128,
+        "Role": {
+          "Fn::GetAtt": [
+            "CostGuardRole",
+            "Arn"
+          ]
+        },
+        "Environment": {
+          "Variables": {
+            "ASG_NAME": {
+              "Ref": "AutoScalingGroup"
+            },
+            "SCALING_RULE": {
+              "Ref": "SchedulerRule"
+            },
+            "ENDPOINT_NAME": {
+              "Ref": "SageMakerEndpointName"
+            },
+            "MIN_REMAINING_CREDITS": "35",
+            "STOP_AT_EPOCH": "1793116631"
+          }
+        },
+        "Code": {
+          "ZipFile": "\"\"\"Stop this demo before its credit allowance or 21-day lifetime is exhausted.\"\"\"\nimport os\nimport time\nimport boto3\n\ndef lambda_handler(event, context):\n    region = os.environ['AWS_REGION']\n    reason = None\n    balance = None\n    try:\n        plan = boto3.client('freetier', region_name='us-east-1').get_account_plan_state()\n        balance = float(plan['accountPlanRemainingCredits']['amount'])\n        if plan.get('accountPlanType') != 'FREE' or plan.get('accountPlanStatus') != 'ACTIVE':\n            reason = 'Free account plan is no longer active'\n        elif balance <= float(os.environ['MIN_REMAINING_CREDITS']):\n            reason = f'Credit balance reached {balance}'\n    except Exception as exc:\n        # Fail closed: protecting the credit allowance takes priority over uptime.\n        reason = f'Unable to verify credit protection: {exc}'\n    if time.time() >= float(os.environ['STOP_AT_EPOCH']):\n        reason = '21-day demo lifetime ended'\n    if not reason:\n        return {'status': 'running', 'remaining_credits': balance}\n    events = boto3.client('events', region_name=region)\n    events.disable_rule(Name=os.environ['SCALING_RULE'])\n    boto3.client('autoscaling', region_name=region).update_auto_scaling_group(\n        AutoScalingGroupName=os.environ['ASG_NAME'], MinSize=0, MaxSize=0, DesiredCapacity=0)\n    sm = boto3.client('sagemaker', region_name=region)\n    try:\n        sm.delete_endpoint(EndpointName=os.environ['ENDPOINT_NAME'])\n    except sm.exceptions.ClientError as exc:\n        if 'Could not find' not in str(exc) and 'does not exist' not in str(exc):\n            raise\n    for page in sm.get_paginator('list_training_jobs').paginate(NameContains='infra-watchdog', StatusEquals='InProgress'):\n        for job in page.get('TrainingJobSummaries', []):\n            if job['TrainingJobName'].startswith('infra-watchdog'):\n                sm.stop_training_job(TrainingJobName=job['TrainingJobName'])\n    print({'shutdown_reason': reason, 'remaining_credits': balance})\n    return {'status': 'stopped', 'reason': reason, 'remaining_credits': balance}\n"
+        }
+      }
+    },
+    "CostGuardSchedule": {
+      "Type": "AWS::Events::Rule",
+      "Properties": {
+        "Name": "infra-watchdog-cost-check",
+        "ScheduleExpression": "rate(1 hour)",
+        "State": "ENABLED",
+        "Targets": [
+          {
+            "Arn": {
+              "Fn::GetAtt": [
+                "CostGuardFunction",
+                "Arn"
+              ]
+            },
+            "Id": "CostGuard"
+          }
+        ]
+      }
+    },
+    "CostGuardPermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "CostGuardFunction"
+        },
+        "Action": "lambda:InvokeFunction",
+        "Principal": "events.amazonaws.com",
+        "SourceArn": {
+          "Fn::GetAtt": [
+            "CostGuardSchedule",
+            "Arn"
+          ]
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "MetricsBucketName": {
+      "Value": {
+        "Ref": "MetricsBucket"
+      }
+    },
+    "AutoScalingGroupName": {
+      "Value": {
+        "Ref": "AutoScalingGroup"
+      }
+    },
+    "SageMakerExecutionRoleArn": {
+      "Value": {
+        "Fn::GetAtt": [
+          "SageMakerExecutionRole",
+          "Arn"
+        ]
+      }
+    },
+    "ScalingGuardrailFunctionName": {
+      "Value": {
+        "Ref": "ScalingGuardrailFunction"
+      }
+    },
+    "SchedulerRuleName": {
+      "Value": {
+        "Ref": "SchedulerRule"
+      }
+    }
+  }
+}
