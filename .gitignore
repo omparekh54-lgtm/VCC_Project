@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+metrics_log.csv
+locust_report*
+*.joblib
+model/
+.DS_Store
