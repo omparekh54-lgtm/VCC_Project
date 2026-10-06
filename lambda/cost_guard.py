@@ -7,20 +7,35 @@ def lambda_handler(event, context):
     region = os.environ['AWS_REGION']
     reason = None
     balance = None
+    used = None
     try:
         plan = boto3.client('freetier', region_name='us-east-1').get_account_plan_state()
         balance = float(plan['accountPlanRemainingCredits']['amount'])
+        activities = []
+        params = {}
+        free_tier = boto3.client('freetier', region_name='us-east-1')
+        while True:
+            page = free_tier.list_account_activities(**params)
+            activities.extend(page.get('activities', []))
+            if not page.get('nextToken'):
+                break
+            params['nextToken'] = page['nextToken']
+        granted = float(os.environ['INITIAL_FREE_CREDITS']) + sum(
+            float(a['reward']['credit']['amount']) for a in activities
+            if a.get('status') == 'COMPLETED' and
+            a.get('reward', {}).get('credit', {}).get('unit') == 'USD')
+        used = max(0.0, granted - balance)
         if plan.get('accountPlanType') != 'FREE' or plan.get('accountPlanStatus') != 'ACTIVE':
             reason = 'Free account plan is no longer active'
-        elif balance <= float(os.environ['MIN_REMAINING_CREDITS']):
-            reason = f'Credit balance reached {balance}'
+        elif used >= float(os.environ['MAX_CREDIT_USAGE']):
+            reason = f'Credit consumption reached {used}'
     except Exception as exc:
         # Fail closed: protecting the credit allowance takes priority over uptime.
         reason = f'Unable to verify credit protection: {exc}'
     if time.time() >= float(os.environ['STOP_AT_EPOCH']):
         reason = '21-day demo lifetime ended'
     if not reason:
-        return {'status': 'running', 'remaining_credits': balance}
+        return {'status': 'running', 'remaining_credits': balance, 'credits_used': used}
     events = boto3.client('events', region_name=region)
     events.disable_rule(Name=os.environ['SCALING_RULE'])
     boto3.client('autoscaling', region_name=region).update_auto_scaling_group(

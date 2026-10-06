@@ -175,13 +175,13 @@ aws cloudformation delete-stack --stack-name infra-watchdog
 
 ## Credit-protected demonstration deployment
 
-The demonstration uses one EC2 instance (`MaxCapacity=1`) and one small
+The demonstration uses one Free-plan-compatible `t3.small` EC2 instance (`MaxCapacity=1`) and one small
 SageMaker inference endpoint in `ap-south-1`. CPU bursting is in standard
 mode to avoid surplus CPU-credit charges. With the one-instance ceiling,
 the watchdog can predict latency and publish metrics but cannot add servers.
 
 An hourly AWS cost-guard Lambda stops the EC2 group and deletes the inference
-endpoint when Free Tier credits fall to $35, when the Free plan is no longer
+endpoint when total credit consumption reaches $65 (including earned reward credits), when the Free plan is no longer
 active, or at the deployment-specific 21-day deadline in its environment.
 The earlier $65-used trigger allows a buffer for delayed billing updates;
 it is not an exact spending cap. Small retained S3 data and logs may still

@@ -12,7 +12,7 @@
     },
     "InstanceType": {
       "Type": "String",
-      "Default": "t3.medium"
+      "Default": "t3.small"
     },
     "MaxCapacity": {
       "Type": "Number",
@@ -197,7 +197,7 @@
         "MaxSize": {
           "Ref": "MaxCapacity"
         },
-        "DesiredCapacity": "0",
+        "DesiredCapacity": "1",
         "VPCZoneIdentifier": {
           "Ref": "SubnetIds"
         },
@@ -412,7 +412,10 @@
               "Statement": [
                 {
                   "Effect": "Allow",
-                  "Action": "freetier:GetAccountPlanState",
+                  "Action": [
+                    "freetier:GetAccountPlanState",
+                    "freetier:ListAccountActivities"
+                  ],
                   "Resource": "*"
                 },
                 {
@@ -482,12 +485,13 @@
             "ENDPOINT_NAME": {
               "Ref": "SageMakerEndpointName"
             },
-            "MIN_REMAINING_CREDITS": "35",
-            "STOP_AT_EPOCH": "1793116631"
+            "STOP_AT_EPOCH": "1793116631",
+            "MAX_CREDIT_USAGE": "65",
+            "INITIAL_FREE_CREDITS": "100"
           }
         },
         "Code": {
-          "ZipFile": "\"\"\"Stop this demo before its credit allowance or 21-day lifetime is exhausted.\"\"\"\nimport os\nimport time\nimport boto3\n\ndef lambda_handler(event, context):\n    region = os.environ['AWS_REGION']\n    reason = None\n    balance = None\n    try:\n        plan = boto3.client('freetier', region_name='us-east-1').get_account_plan_state()\n        balance = float(plan['accountPlanRemainingCredits']['amount'])\n        if plan.get('accountPlanType') != 'FREE' or plan.get('accountPlanStatus') != 'ACTIVE':\n            reason = 'Free account plan is no longer active'\n        elif balance <= float(os.environ['MIN_REMAINING_CREDITS']):\n            reason = f'Credit balance reached {balance}'\n    except Exception as exc:\n        # Fail closed: protecting the credit allowance takes priority over uptime.\n        reason = f'Unable to verify credit protection: {exc}'\n    if time.time() >= float(os.environ['STOP_AT_EPOCH']):\n        reason = '21-day demo lifetime ended'\n    if not reason:\n        return {'status': 'running', 'remaining_credits': balance}\n    events = boto3.client('events', region_name=region)\n    events.disable_rule(Name=os.environ['SCALING_RULE'])\n    boto3.client('autoscaling', region_name=region).update_auto_scaling_group(\n        AutoScalingGroupName=os.environ['ASG_NAME'], MinSize=0, MaxSize=0, DesiredCapacity=0)\n    sm = boto3.client('sagemaker', region_name=region)\n    try:\n        sm.delete_endpoint(EndpointName=os.environ['ENDPOINT_NAME'])\n    except sm.exceptions.ClientError as exc:\n        if 'Could not find' not in str(exc) and 'does not exist' not in str(exc):\n            raise\n    for page in sm.get_paginator('list_training_jobs').paginate(NameContains='infra-watchdog', StatusEquals='InProgress'):\n        for job in page.get('TrainingJobSummaries', []):\n            if job['TrainingJobName'].startswith('infra-watchdog'):\n                sm.stop_training_job(TrainingJobName=job['TrainingJobName'])\n    print({'shutdown_reason': reason, 'remaining_credits': balance})\n    return {'status': 'stopped', 'reason': reason, 'remaining_credits': balance}\n"
+          "ZipFile": "\"\"\"Stop this demo before its credit allowance or 21-day lifetime is exhausted.\"\"\"\nimport os\nimport time\nimport boto3\n\ndef lambda_handler(event, context):\n    region = os.environ['AWS_REGION']\n    reason = None\n    balance = None\n    used = None\n    try:\n        plan = boto3.client('freetier', region_name='us-east-1').get_account_plan_state()\n        balance = float(plan['accountPlanRemainingCredits']['amount'])\n        activities = []\n        params = {}\n        free_tier = boto3.client('freetier', region_name='us-east-1')\n        while True:\n            page = free_tier.list_account_activities(**params)\n            activities.extend(page.get('activities', []))\n            if not page.get('nextToken'):\n                break\n            params['nextToken'] = page['nextToken']\n        granted = float(os.environ['INITIAL_FREE_CREDITS']) + sum(\n            float(a['reward']['credit']['amount']) for a in activities\n            if a.get('status') == 'COMPLETED' and\n            a.get('reward', {}).get('credit', {}).get('unit') == 'USD')\n        used = max(0.0, granted - balance)\n        if plan.get('accountPlanType') != 'FREE' or plan.get('accountPlanStatus') != 'ACTIVE':\n            reason = 'Free account plan is no longer active'\n        elif used >= float(os.environ['MAX_CREDIT_USAGE']):\n            reason = f'Credit consumption reached {used}'\n    except Exception as exc:\n        # Fail closed: protecting the credit allowance takes priority over uptime.\n        reason = f'Unable to verify credit protection: {exc}'\n    if time.time() >= float(os.environ['STOP_AT_EPOCH']):\n        reason = '21-day demo lifetime ended'\n    if not reason:\n        return {'status': 'running', 'remaining_credits': balance, 'credits_used': used}\n    events = boto3.client('events', region_name=region)\n    events.disable_rule(Name=os.environ['SCALING_RULE'])\n    boto3.client('autoscaling', region_name=region).update_auto_scaling_group(\n        AutoScalingGroupName=os.environ['ASG_NAME'], MinSize=0, MaxSize=0, DesiredCapacity=0)\n    sm = boto3.client('sagemaker', region_name=region)\n    try:\n        sm.delete_endpoint(EndpointName=os.environ['ENDPOINT_NAME'])\n    except sm.exceptions.ClientError as exc:\n        if 'Could not find' not in str(exc) and 'does not exist' not in str(exc):\n            raise\n    for page in sm.get_paginator('list_training_jobs').paginate(NameContains='infra-watchdog', StatusEquals='InProgress'):\n        for job in page.get('TrainingJobSummaries', []):\n            if job['TrainingJobName'].startswith('infra-watchdog'):\n                sm.stop_training_job(TrainingJobName=job['TrainingJobName'])\n    print({'shutdown_reason': reason, 'remaining_credits': balance})\n    return {'status': 'stopped', 'reason': reason, 'remaining_credits': balance}\n"
         }
       }
     },
