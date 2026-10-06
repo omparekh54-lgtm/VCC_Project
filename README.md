@@ -57,8 +57,10 @@ cd infra
 This also uploads `backend/app.py` and `backend/requirements.txt` to the new
 bucket, which the EC2 launch template pulls from on boot.
 
-**2. Launch the app instance** (kept at desired capacity 0 until step 1's
-upload completes, so it doesn't boot before the code exists):
+**2. Ensure the app instance is running.** The current template starts one
+instance automatically. Upload the app files before starting a fresh instance;
+if an instance booted before the files were available, restart the deployment
+only after confirming its cost guard has not requested shutdown:
 
 ```bash
 aws autoscaling set-desired-capacity \
@@ -193,3 +195,18 @@ same Random Forest locally and uploads an inference-ready `ml/model.tar.gz`.
 
 This repository supplies an API backend, accessible through FastAPI `/docs`;
 it does not include a separate frontend dashboard.
+
+## Live demonstration
+
+Deployed on 6 October 2026 in Mumbai (`ap-south-1`).
+
+- Interactive API: http://13.127.199.17:8000/docs
+- Health: http://13.127.199.17:8000/health
+- Server readings: http://13.127.199.17:8000/metrics
+
+The public IP can change if the EC2 instance is replaced. This demo uses HTTP.
+The app fleet is capped at one EC2 instance; the SageMaker prediction endpoint
+is a separate managed resource and is included in the cost estimate.
+Allow approximately $50–$60 in credits for three weeks of continuous operation;
+actual usage varies. Compute shuts down after $65 of account credit consumption
+or at the configured 27 October 2026 deadline, whichever comes first.
