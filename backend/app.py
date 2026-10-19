@@ -289,6 +289,7 @@ async def prediction():
         "horizon_s": None,
         "threshold_ms": LATENCY_THRESHOLD_MS,
         "would_scale_out": None,
+        "scaling_suppressed_reason": None,
         "features": features,
         "recent_latency_ms": recent_ms,
         "recent_requests": recent_n,
@@ -301,8 +302,10 @@ async def prediction():
     except Exception as exc:  # model file unreadable, endpoint deleted, no permission...
         body["error"] = f"{type(exc).__name__}: {exc}"[:300]
     else:
+        has_traffic = features["active_connections"] > 0 or features["recent_latency_ms"] > 0
         body.update(available=True, source=source, predicted_ms=predicted, horizon_s=horizon_s,
-                    would_scale_out=predicted > LATENCY_THRESHOLD_MS)
+                    would_scale_out=has_traffic and predicted > LATENCY_THRESHOLD_MS,
+                    scaling_suppressed_reason=None if has_traffic else "no recent business traffic")
     return body
 
 

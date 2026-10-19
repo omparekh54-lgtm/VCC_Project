@@ -67,6 +67,7 @@ def test_prediction_local_and_sagemaker_agree(client, tmp_path, monkeypatch):
             'predicts': 'change_from_recent_latency'}
     path.with_name('model_meta.json').write_text(json.dumps(meta))
     monkeypatch.setattr(backend, 'MODEL_PATH', path)
+    backend.state.active_connections = 1
     prediction = client.get('/prediction').json()
     assert prediction['available'] is True
     assert prediction['predicted_ms'] == 600
@@ -128,3 +129,27 @@ def test_training_data_errors_are_actionable():
         training.time_split(pd.DataFrame(), .2, 30, 10)
     with pytest.raises(ValueError, match='test_fraction'):
         training.time_split(pd.DataFrame(), 1., 30, 10)
+
+
+def test_idle_forecast_does_not_request_scaling(client, monkeypatch):
+    monkeypatch.setattr(backend.predictor, 'predict', lambda features: (600., 30., 'local model'))
+    result = client.get('/prediction').json()
+    assert result['available'] and result['predicted_ms'] == 600
+    assert result['would_scale_out'] is False
+    assert result['scaling_suppressed_reason'] == 'no recent business traffic'
+
+
+def test_lambda_suppresses_idle_forecast(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    monkeypatch.setenv('SAGEMAKER_ENDPOINT_NAME', 'test')
+    monkeypatch.setenv('ASG_NAME', 'test')
+    monkeypatch.setitem(sys.modules, 'boto3', SimpleNamespace(client=lambda name: object()))
+    guard = load_module('watchdog_guard', 'lambda/lambda_function.py')
+    monkeypatch.setattr(guard, 'fetch_metrics', lambda: {'active_connections': 0, 'recent_latency_ms': 0})
+    monkeypatch.setattr(guard, 'predict_latency', lambda metrics: 600.)
+    monkeypatch.setattr(guard, 'put_metric', lambda *args: None)
+    def unexpected_scale():
+        raise AssertionError('idle forecast must not scale out')
+    monkeypatch.setattr(guard, 'scale_out', unexpected_scale)
+    assert guard.run_check() == (600., 'idle: no recent business traffic')

@@ -138,7 +138,11 @@ def run_check():
 
     predicted = predict_latency(metrics)
     put_metric("PredictedLatencyMs", predicted, "Milliseconds")
-    outcome = scale_out() if predicted > LATENCY_THRESHOLD_MS else "ok"
+    has_traffic = metrics["active_connections"] > 0 or metrics.get("recent_latency_ms", 0) > 0
+    if not has_traffic:
+        outcome = "idle: no recent business traffic"
+    else:
+        outcome = scale_out() if predicted > LATENCY_THRESHOLD_MS else "ok"
     print(f"metrics={metrics} predicted_latency_ms={predicted:.1f} outcome={outcome}")
     return predicted, outcome
 

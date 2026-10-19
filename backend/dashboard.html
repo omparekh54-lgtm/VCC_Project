@@ -682,6 +682,11 @@
       $('f-source').textContent = `model: ${p.source}`;
       $('f-label').textContent = horizon ? `Predicted latency in ${horizon} s` : 'Predicted latency';
       $('f-pred').innerHTML = fmtMs(p.predicted_ms).replace(/ (m?s)$/, '<small>$1</small>');
+      if (p.scaling_suppressed_reason) {
+        setVerdict('idle', 'No recent business traffic');
+        $('f-explain').textContent = 'Scale-out requests are suppressed while there are no active or recently completed API requests.';
+        return;
+      }
       if (p.would_scale_out) setVerdict('critical', `Above ${p.threshold_ms} ms: scale-out requested if capacity allows`);
       else setVerdict('good', `Below ${p.threshold_ms} ms: no action needed`);
       $('f-explain').textContent = `Every 30 s the Lambda sends these readings to the model. A forecast above ` +
