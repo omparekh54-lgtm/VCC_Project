@@ -13,6 +13,12 @@ Each invocation:
   3. If the prediction crosses LATENCY_THRESHOLD_MS, scales the Auto Scaling
      group out by one instance.
 
+If /metrics doesn't answer within the timeout, that is treated as overload
+too, not as an error: the app serves /metrics from the same event loop that
+CPU-heavy requests block, so the server goes quiet exactly when it is most
+saturated. Crashing there would leave the guardrail blind at the worst time.
+Only timeouts count -- a refused connection (app down) still raises.
+
 NOTE ON SERVICE NAMES: step 3 scales the group via Amazon EC2 Auto Scaling
 (the `autoscaling` boto3 client) rather than the separate "AWS Application
 Auto Scaling" service. Application Auto Scaling covers resources like ECS,
@@ -33,9 +39,11 @@ this).
 import json
 import os
 import time
+import urllib.error
 import urllib.request
 
 import boto3
+from botocore.exceptions import ClientError
 
 SAGEMAKER_ENDPOINT_NAME = os.environ["SAGEMAKER_ENDPOINT_NAME"]
 ASG_NAME = os.environ["ASG_NAME"]
@@ -64,20 +72,24 @@ def get_app_instance_ip() -> str:
     return ip
 
 
-def fetch_metrics() -> dict:
+def fetch_metrics():
+    """Current readings, or None if the app is too busy to answer in time."""
     ip = get_app_instance_ip()
-    with urllib.request.urlopen(f"http://{ip}:{APP_PORT}/metrics", timeout=5) as resp:
-        return json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(f"http://{ip}:{APP_PORT}/metrics", timeout=5) as resp:
+            return json.loads(resp.read().decode())
+    except TimeoutError:
+        return None
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            return None
+        raise
 
 
 def predict_latency(metrics: dict) -> float:
-    payload = json.dumps(
-        {
-            "cpu_usage": metrics["cpu_usage"],
-            "active_connections": metrics["active_connections"],
-            "lag_ms": metrics["lag_ms"],
-        }
-    )
+    # Forward /metrics as-is: the endpoint picks the features its model was
+    # trained on (see ml/inference.py), so adding one needs no change here.
+    payload = json.dumps(metrics)
     response = sagemaker_runtime.invoke_endpoint(
         EndpointName=SAGEMAKER_ENDPOINT_NAME,
         ContentType="application/json",
@@ -87,33 +99,46 @@ def predict_latency(metrics: dict) -> float:
     return result["predicted_response_time_ms"][0]
 
 
-def maybe_scale_out(predicted_latency_ms: float) -> str:
+def put_metric(name: str, value: float, unit: str) -> None:
     cloudwatch.put_metric_data(
-        Namespace="InfraWatchdog",
-        MetricData=[{"MetricName": "PredictedLatencyMs", "Value": predicted_latency_ms, "Unit": "Milliseconds"}],
+        Namespace="InfraWatchdog", MetricData=[{"MetricName": name, "Value": value, "Unit": unit}]
     )
 
-    if predicted_latency_ms <= LATENCY_THRESHOLD_MS:
-        return "ok"
 
+def scale_out() -> str:
     group = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[ASG_NAME])[
         "AutoScalingGroups"
     ][0]
     current, max_cap = group["DesiredCapacity"], group["MaxSize"]
     new_capacity = min(current + MAX_SCALE_STEP, max_cap)
 
-    if new_capacity > current:
+    if new_capacity <= current:
+        return "already at max capacity"
+    try:
         autoscaling.set_desired_capacity(
             AutoScalingGroupName=ASG_NAME, DesiredCapacity=new_capacity, HonorCooldown=True
         )
-        return f"scaled {current} -> {new_capacity}"
-    return "already at max capacity"
+    except ClientError as exc:
+        # With HonorCooldown, AWS rejects the call while the previous scale-out
+        # is still in its cooldown. That's expected during a sustained overload
+        # (the alarm fires on every check), not a failure.
+        if exc.response["Error"]["Code"] == "ScalingActivityInProgress":
+            return f"scale-out already in progress (cooldown), capacity {current}"
+        raise
+    return f"scaled {current} -> {new_capacity}"
 
 
 def run_check():
     metrics = fetch_metrics()
+    put_metric("MetricsUnreachable", 0 if metrics else 1, "Count")
+    if metrics is None:
+        outcome = scale_out()
+        print(f"/metrics timed out, treating as overload; outcome={outcome}")
+        return None, outcome
+
     predicted = predict_latency(metrics)
-    outcome = maybe_scale_out(predicted)
+    put_metric("PredictedLatencyMs", predicted, "Milliseconds")
+    outcome = scale_out() if predicted > LATENCY_THRESHOLD_MS else "ok"
     print(f"metrics={metrics} predicted_latency_ms={predicted:.1f} outcome={outcome}")
     return predicted, outcome
 

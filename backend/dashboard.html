@@ -1,0 +1,841 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Infra Watchdog</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  /* Dark brown is the default theme; beige is the light theme (toggle in the header). */
+  :root, :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page:        #1a120c;
+    --page-2:      #24180f;
+    --surface:     #271b13;
+    --surface-2:   #312318;
+    --rule:        #43311f;
+    --grid:        #34261a;
+    --ink:         #f2e7d5;
+    --ink-2:       #cdb99c;
+    --ink-3:       #937d64;
+    --series:      #e0a96d;
+    --series-soft: rgba(192, 125, 60, .18);
+    --s-actual:    #c07d3c;
+    --s-pred:      #3e95cc;
+    --good:        #8fbf6a;
+    --warning:     #e6ae45;
+    --critical:    #e3735a;
+    --btn-ink:     #1a120c;
+    --shadow:      0 1px 0 rgba(255, 240, 220, .04) inset, 0 10px 30px -18px rgba(0, 0, 0, .7);
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --page:        #efe5d4;
+    --page-2:      #e6d8c1;
+    --surface:     #faf4ea;
+    --surface-2:   #f3e9d9;
+    --rule:        #dbc9ad;
+    --grid:        #ebdfcb;
+    --ink:         #2e1f14;
+    --ink-2:       #5f4a37;
+    --ink-3:       #8e7660;
+    --series:      #9c5a2a;
+    --series-soft: rgba(156, 90, 42, .13);
+    --s-actual:    #9c5a2a;
+    --s-pred:      #1c6fa3;
+    --good:        #4f7f2f;
+    --warning:     #b07516;
+    --critical:    #b4462d;
+    --btn-ink:     #faf4ea;
+    --shadow:      0 10px 28px -20px rgba(70, 40, 15, .45);
+  }
+  :root {
+    --mono: "JetBrains Mono", ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
+    --sans: Inter, system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    --serif: Fraunces, Georgia, "Times New Roman", serif;
+    --radius: 14px;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background:
+      radial-gradient(1200px 500px at 85% -10%, var(--page-2), transparent 70%),
+      var(--page);
+    background-attachment: fixed;
+    color: var(--ink);
+    font: 14px/1.5 var(--sans);
+    -webkit-font-smoothing: antialiased;
+    transition: background-color .25s, color .25s;
+  }
+  .num, code, .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  a { color: inherit; text-underline-offset: 3px; text-decoration-color: var(--ink-3); }
+  a:hover { text-decoration-color: var(--series); color: var(--series); }
+
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 0 24px; }
+
+  /* ---- top bar ---- */
+  header {
+    position: sticky; top: 0; z-index: 10;
+    background: color-mix(in srgb, var(--page) 82%, transparent);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--rule);
+  }
+  header .wrap { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; min-height: 62px; padding-top: 8px; padding-bottom: 8px; }
+  .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; }
+  .logo {
+    width: 34px; height: 34px; border-radius: 10px; flex: none;
+    display: grid; place-items: center;
+    background: linear-gradient(145deg, var(--series), color-mix(in srgb, var(--series) 55%, #3a2312));
+    color: var(--btn-ink);
+  }
+  .brand-name { font-family: var(--serif); font-weight: 600; font-size: 19px; letter-spacing: -0.01em; }
+  .host { color: var(--ink-3); font-size: 12px; padding: 3px 9px; border: 1px solid var(--rule); border-radius: 999px; }
+  .spacer { flex: 1; }
+  .state {
+    display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-2);
+    padding: 5px 12px; border-radius: 999px; background: var(--surface); border: 1px solid var(--rule);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); flex: none; }
+  .dot.good { background: var(--good); box-shadow: 0 0 0 4px color-mix(in srgb, var(--good) 22%, transparent); animation: pulse 2s infinite; }
+  .dot.warning { background: var(--warning); box-shadow: 0 0 0 4px color-mix(in srgb, var(--warning) 22%, transparent); }
+  .dot.critical { background: var(--critical); box-shadow: 0 0 0 4px color-mix(in srgb, var(--critical) 22%, transparent); }
+  @keyframes pulse { 50% { box-shadow: 0 0 0 7px color-mix(in srgb, var(--good) 0%, transparent); } }
+  @media (prefers-reduced-motion: reduce) { .dot.good { animation: none; } }
+
+  button, select {
+    font: inherit; font-size: 13px; color: var(--ink);
+    background: var(--surface); border: 1px solid var(--rule); border-radius: 9px;
+    padding: 6px 12px; cursor: pointer; transition: border-color .15s, background-color .15s, opacity .15s;
+  }
+  button:hover, select:hover { border-color: var(--series); }
+  button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--series); outline-offset: 2px; }
+  button.primary { background: var(--series); color: var(--btn-ink); border-color: var(--series); font-weight: 600; }
+  button.primary:hover { opacity: .9; }
+  button:disabled { opacity: .45; cursor: default; }
+  .icon-btn { display: inline-flex; align-items: center; gap: 6px; }
+
+  /* ---- hero ---- */
+  .hero { padding: 34px 0 8px; display: flex; align-items: flex-end; gap: 24px; flex-wrap: wrap; }
+  .hero h1 { font-family: var(--serif); font-weight: 600; font-size: clamp(28px, 4vw, 40px); line-height: 1.1; letter-spacing: -0.02em; margin: 0; }
+  .hero p { margin: 10px 0 0; color: var(--ink-2); max-width: 640px; font-size: 15px; }
+  .pipeline { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 16px; font-size: 12px; color: var(--ink-2); }
+  .pipeline span { padding: 4px 10px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--rule); }
+  .pipeline i { font-style: normal; color: var(--ink-3); align-self: center; }
+
+  main.wrap { padding-bottom: 40px; }
+  section { margin-top: 26px; }
+  .section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin: 0 0 10px; }
+  h2 { font-family: var(--serif); font-size: 20px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+  .section-head .note { color: var(--ink-3); font-size: 12px; }
+  .panel { background: var(--surface); border: 1px solid var(--rule); border-radius: var(--radius); box-shadow: var(--shadow); }
+
+  /* ---- readouts ---- */
+  .readouts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+  .readout { padding: 16px 18px 14px; min-width: 0; position: relative; overflow: hidden; }
+  .readout::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--series); opacity: .75; }
+  .readout .label { font-size: 12px; color: var(--ink-2); font-weight: 500; text-transform: uppercase; letter-spacing: .06em; }
+  .readout .value { font-size: 32px; line-height: 1.15; margin-top: 6px; letter-spacing: -0.02em; font-weight: 600; }
+  .readout .value small { font-size: 13px; color: var(--ink-3); margin-left: 4px; letter-spacing: 0; font-weight: 400; }
+  .readout .sub { font-size: 12px; color: var(--ink-3); margin-top: 4px; }
+
+  /* ---- charts ---- */
+  .charts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  .chart { padding: 14px 16px 10px; position: relative; min-width: 0; }
+  .chart .title { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; }
+  .chart .title b { font-weight: 600; }
+  .chart .title span { color: var(--ink-3); font-size: 12px; }
+  .chart svg { display: block; width: 100%; height: 160px; margin-top: 8px; overflow: visible; }
+  .chart svg text { font-family: var(--mono); font-size: 10.5px; fill: var(--ink-3); }
+  .chart .grid line { stroke: var(--grid); stroke-width: 1; }
+  .chart .axis { stroke: var(--rule); stroke-width: 1; }
+  .chart .area { fill: var(--series-soft); stroke: none; }
+  .chart .line { fill: none; stroke: var(--s-actual); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  .chart .line.pred { stroke: var(--s-pred); }
+  .chart .last { fill: var(--s-actual); stroke: var(--surface); stroke-width: 2; }
+  .chart .last.pred { fill: var(--s-pred); }
+  .chart text.last-label { fill: var(--ink); font-weight: 600; }
+  .chart .threshold { stroke: var(--critical); stroke-width: 1; stroke-dasharray: 4 3; }
+  .chart text.threshold-label { fill: var(--critical); }
+  .chart .cross { stroke: var(--ink-3); stroke-width: 1; }
+  .chart .hover-dot { fill: var(--s-actual); stroke: var(--surface); stroke-width: 2; }
+  .chart .hover-dot.pred { fill: var(--s-pred); }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--ink-2); margin-top: 4px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 14px; height: 3px; border-radius: 2px; background: var(--s-actual); display: inline-block; }
+  .swatch.pred { background: var(--s-pred); }
+  .chart.wide { grid-column: 1 / -1; }
+
+  /* ---- forecast ---- */
+  .forecast { display: grid; grid-template-columns: 1.1fr 1fr 1fr; }
+  .forecast > div { padding: 18px 20px; min-width: 0; }
+  .forecast > div + div { border-left: 1px solid var(--rule); }
+  .forecast .label { font-size: 12px; color: var(--ink-2); font-weight: 500; text-transform: uppercase; letter-spacing: .06em; }
+  .forecast .big { font-size: 40px; line-height: 1.1; font-weight: 600; letter-spacing: -0.02em; margin-top: 6px; }
+  .forecast .big small { font-size: 15px; color: var(--ink-3); margin-left: 4px; font-weight: 400; letter-spacing: 0; }
+  .forecast .sub { font-size: 12px; color: var(--ink-3); margin-top: 4px; }
+  .verdict { display: inline-flex; align-items: center; gap: 8px; margin-top: 10px; padding: 7px 12px; border-radius: 10px;
+             font-weight: 600; font-size: 14px; border: 1px solid var(--rule); background: var(--surface-2); }
+  .verdict svg { flex: none; }
+  .verdict.good { color: var(--good); border-color: color-mix(in srgb, var(--good) 45%, transparent); }
+  .verdict.critical { color: var(--critical); border-color: color-mix(in srgb, var(--critical) 45%, transparent); }
+  .verdict.idle { color: var(--ink-3); }
+  .forecast .explain { font-size: 13px; color: var(--ink-2); margin-top: 10px; }
+  .forecast code { font-size: 12px; background: var(--surface-2); padding: 1px 5px; border-radius: 4px; }
+  .chart .empty { fill: var(--ink-3); font-family: var(--sans); font-size: 12px; }
+  .tip {
+    position: absolute; pointer-events: none; display: none; z-index: 2;
+    background: var(--ink); color: var(--btn-ink); font-size: 12px; padding: 4px 8px; border-radius: 6px;
+    white-space: nowrap; font-family: var(--mono);
+  }
+
+  /* ---- load generator ---- */
+  .loadgen { display: grid; grid-template-columns: 310px 1fr; overflow: hidden; }
+  .controls { padding: 18px; border-right: 1px solid var(--rule); background: var(--surface-2); }
+  .field { margin-bottom: 14px; }
+  .field label { display: block; font-size: 12px; color: var(--ink-2); margin-bottom: 6px; font-weight: 500; }
+  .field .row { display: flex; align-items: center; gap: 10px; }
+  .field input[type=range] { flex: 1; accent-color: var(--series); }
+  .field select { width: 100%; }
+  .field .hint { font-size: 12px; color: var(--ink-3); margin-top: 5px; }
+  .actions { display: flex; gap: 8px; margin-top: 6px; }
+  .actions button { flex: 1; padding: 9px 10px; }
+
+  .results { min-width: 0; display: flex; flex-direction: column; }
+  .stats { display: grid; grid-template-columns: repeat(6, 1fr); border-bottom: 1px solid var(--rule); }
+  .stat { padding: 12px 16px; border-left: 1px solid var(--rule); }
+  .stat:first-child { border-left: 0; }
+  .stat .label { font-size: 11px; color: var(--ink-3); text-transform: uppercase; letter-spacing: .06em; }
+  .stat .value { font-size: 19px; font-weight: 600; margin-top: 2px; }
+  .runline { padding: 9px 16px; font-size: 12px; color: var(--ink-2); border-bottom: 1px solid var(--rule); display: flex; gap: 8px; align-items: center; }
+
+  .log { overflow: auto; max-height: 280px; flex: 1; }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  th, td { text-align: left; padding: 6px 16px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  th { font-weight: 600; color: var(--ink-3); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; position: sticky; top: 0; background: var(--surface); border-bottom: 1px solid var(--rule); }
+  tbody tr:hover td { background: var(--surface-2); }
+  td.r, th.r { text-align: right; }
+  td.slow { color: var(--critical); font-weight: 600; }
+  .empty-row td { color: var(--ink-3); font-family: var(--sans); padding: 22px 16px; }
+
+  footer { color: var(--ink-3); font-size: 12px; padding: 0 0 30px; }
+  footer .wrap { display: flex; gap: 18px; flex-wrap: wrap; align-items: center; border-top: 1px solid var(--rule); padding-top: 16px; }
+
+  @media (max-width: 900px) {
+    .forecast { grid-template-columns: 1fr; }
+    .forecast > div + div { border-left: 0; border-top: 1px solid var(--rule); }
+    .readouts { grid-template-columns: 1fr 1fr; }
+    .charts { grid-template-columns: 1fr; }
+    .loadgen { grid-template-columns: 1fr; }
+    .controls { border-right: 0; border-bottom: 1px solid var(--rule); }
+    .stats { grid-template-columns: repeat(3, 1fr); }
+    .stat:nth-child(4) { border-left: 0; }
+    .stat:nth-child(n+4) { border-top: 1px solid var(--rule); }
+  }
+  @media (max-width: 520px) {
+    .wrap { padding: 0 16px; }
+    .host { display: none; }
+    .readouts { gap: 10px; }
+    .readout .value { font-size: 24px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <a class="brand" href="/">
+      <span class="logo" aria-hidden="true">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 3l8 3v6c0 4.5-3.4 8.2-8 9-4.6-.8-8-4.5-8-9V6l8-3z"/><path d="M7.5 12.5h2.2l1.5-3 2 6 1.4-3h2"/>
+        </svg>
+      </span>
+      <span class="brand-name">Infra Watchdog</span>
+    </a>
+    <span class="host mono" id="host"></span>
+    <div class="spacer"></div>
+    <div class="state"><span class="dot" id="state-dot"></span><span id="state-text">connecting</span></div>
+    <button id="pause" type="button">Pause</button>
+    <button id="theme" class="icon-btn" type="button" aria-label="Switch colour theme">Beige</button>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <div class="hero">
+    <div>
+      <h1>Server health, live.</h1>
+      <p>The readings the AI watchdog uses to predict API latency before it degrades, so the scaling guardrail can step in before users notice a slowdown.</p>
+      <div class="pipeline">
+        <span>EC2 app</span><i>→</i><span>/metrics</span><i>→</i><span>Lambda guardrail</span><i>→</i><span>SageMaker model</span><i>→</i><span>scale out</span>
+      </div>
+    </div>
+  </div>
+
+  <section>
+    <div class="section-head"><h2>Current readings</h2><span class="note">refreshed every 2 s</span></div>
+    <div class="readouts">
+      <div class="panel readout">
+        <div class="label">CPU usage</div>
+        <div class="value num" id="r-cpu">–</div>
+        <div class="sub">host-wide, psutil</div>
+      </div>
+      <div class="panel readout">
+        <div class="label">Active connections</div>
+        <div class="value num" id="r-conn">–</div>
+        <div class="sub">in-flight /api requests</div>
+      </div>
+      <div class="panel readout">
+        <div class="label">Event-loop lag</div>
+        <div class="value num" id="r-lag">–</div>
+        <div class="sub">smoothed scheduling delay</div>
+      </div>
+      <div class="panel readout">
+        <div class="label">/metrics round trip</div>
+        <div class="value num" id="r-rtt">–</div>
+        <div class="sub" id="r-rtt-sub">time to answer this poll</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head"><h2>Watchdog forecast</h2><span class="note" id="f-source">model: checking…</span></div>
+    <div class="panel forecast">
+      <div>
+        <div class="label" id="f-label">Predicted latency</div>
+        <div class="big num" id="f-pred">–</div>
+        <div class="verdict idle" id="f-verdict">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" id="f-icon"><circle cx="12" cy="12" r="9"/></svg>
+          <span id="f-verdict-text">Waiting for the model</span>
+        </div>
+      </div>
+      <div>
+        <div class="label">Actual latency now</div>
+        <div class="big num" id="f-actual">–</div>
+        <div class="sub" id="f-actual-sub">mean of /api requests in the last 10 s</div>
+      </div>
+      <div>
+        <div class="label">What the guardrail does</div>
+        <div class="explain" id="f-explain">Every 30 s the Lambda sends these readings to the model. If the forecast is above
+          the threshold, it adds an EC2 instance before the slowdown reaches users.</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head"><h2>Last 5 minutes</h2><span class="note">hover a chart for exact values</span></div>
+    <div class="charts">
+      <div class="panel chart wide" id="c-lat"></div>
+      <div class="panel chart" id="c-cpu"></div>
+      <div class="panel chart" id="c-conn"></div>
+      <div class="panel chart" id="c-lag"></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head"><h2>Load generator</h2><span class="note">sends traffic to /api/simulate</span></div>
+    <div class="panel loadgen">
+      <div class="controls">
+        <div class="field">
+          <label for="intensity">Intensity per request</label>
+          <div class="row">
+            <input type="range" id="intensity" min="0" max="10" value="0">
+            <span class="num" id="intensity-out" style="min-width:6ch;text-align:right">random</span>
+          </div>
+          <div class="hint">0 = random 1–10, same as the Locust script</div>
+        </div>
+        <div class="field">
+          <label for="concurrency">Parallel requests</label>
+          <select id="concurrency">
+            <option value="1">1</option>
+            <option value="2">2</option>
+            <option value="3" selected>3</option>
+            <option value="4">4</option>
+          </select>
+          <div class="hint">Browsers open at most 6 connections per server and this page keeps 2 for its live readings, so 4 is the ceiling here. Use Locust or scripts/collect_demo_data.py for heavier load.</div>
+        </div>
+        <div class="field">
+          <label for="duration">Duration</label>
+          <select id="duration">
+            <option value="30">30 seconds</option>
+            <option value="60" selected>1 minute</option>
+            <option value="180">3 minutes</option>
+            <option value="0">Until stopped</option>
+          </select>
+        </div>
+        <div class="actions">
+          <button class="primary" id="start" type="button">Start</button>
+          <button id="stop" type="button" disabled>Stop</button>
+        </div>
+      </div>
+
+      <div class="results">
+        <div class="stats">
+          <div class="stat"><div class="label">Sent</div><div class="value num" id="s-sent">0</div></div>
+          <div class="stat"><div class="label">Completed</div><div class="value num" id="s-ok">0</div></div>
+          <div class="stat"><div class="label">Errors</div><div class="value num" id="s-err">0</div></div>
+          <div class="stat"><div class="label">p50</div><div class="value num" id="s-p50">–</div></div>
+          <div class="stat"><div class="label">p95</div><div class="value num" id="s-p95">–</div></div>
+          <div class="stat"><div class="label">Max</div><div class="value num" id="s-max">–</div></div>
+        </div>
+        <div class="runline"><span class="dot" id="run-dot"></span><span id="run-text">Idle</span></div>
+        <div class="log">
+          <table>
+            <thead><tr><th>Time</th><th class="r">Intensity</th><th>Status</th><th class="r">Latency</th></tr></thead>
+            <tbody id="log"><tr class="empty-row"><td colspan="4">No requests yet. Start a run to send traffic to /api/simulate.</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <a href="/docs">API reference</a>
+    <a href="/metrics">/metrics</a>
+    <a href="/health">/health</a>
+    <span class="spacer"></span>
+    <span>Dashed line = the guardrail's LATENCY_THRESHOLD_MS, read from the server (500 ms by default).</span>
+  </div>
+</footer>
+
+<script>
+(() => {
+  const POLL_MS = 2000;
+  const POLL_TIMEOUT_MS = 5000;        // same timeout the guardrail Lambda uses
+  const WINDOW_MS = 5 * 60 * 1000;
+  let THRESHOLD_MS = 500;              // replaced by the server's LATENCY_THRESHOLD_MS from /prediction
+  const LOG_ROWS = 60;
+
+  const $ = (id) => document.getElementById(id);
+  $('host').textContent = location.host || 'local file';
+
+  // ------------------------------------------------------------------ theme
+  const root = document.documentElement;
+  function applyTheme(t) {
+    root.dataset.theme = t;
+    $('theme').textContent = t === 'dark' ? 'Beige' : 'Dark brown';
+  }
+  let savedTheme = null;
+  try { savedTheme = localStorage.getItem('iw-theme'); } catch (e) {}
+  applyTheme(savedTheme === 'light' ? 'light' : 'dark');
+  $('theme').addEventListener('click', () => {
+    const next = root.dataset.theme === 'dark' ? 'light' : 'dark';
+    applyTheme(next);
+    try { localStorage.setItem('iw-theme', next); } catch (e) {}
+  });
+
+  // ------------------------------------------------------------------ charts
+  const SVGNS = 'http://www.w3.org/2000/svg';
+  const mk = (tag, attrs = {}, parent) => {
+    const el = document.createElementNS(SVGNS, tag);
+    for (const k in attrs) el.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(el);
+    return el;
+  };
+  const clock = (t) => new Date(t).toLocaleTimeString([], { hour12: false });
+
+  // Round step (1/2/5 x 10^n) so ticks land on readable numbers.
+  function niceScale(v, integer) {
+    const raw = Math.max(v, 1e-9) / 4;
+    const p = Math.pow(10, Math.floor(Math.log10(raw)));
+    let step = [1, 2, 5, 10].map(m => m * p).find(s => s >= raw);
+    if (integer) step = Math.max(1, Math.ceil(step));
+    return { step, max: Math.ceil(v / step) * step };
+  }
+
+  // opts.series: [{ key, cls, label, short }]. One series by default; with two
+  // or more the chart shows a legend, labels each line's latest value, and the
+  // tooltip lists every series at the hovered moment.
+  function makeChart(id, opts) {
+    const series = opts.series || [{ key: 'v', cls: '' }];
+    const host = $(id);
+    const legend = series.length > 1
+      ? `<div class="legend">${series.map(s => `<span><i class="swatch ${s.cls}"></i>${s.label}</span>`).join('')}</div>` : '';
+    host.innerHTML = `<div class="title"><b>${opts.title}</b><span>${opts.note || ''}</span></div>${legend}`;
+    const svg = mk('svg', { role: 'img', 'aria-label': opts.title }, host);
+    const tip = document.createElement('div');
+    tip.className = 'tip';
+    host.appendChild(tip);
+
+    const gGrid = mk('g', { class: 'grid' }, svg);
+    const axis = mk('line', { class: 'axis' }, svg);
+    const area = series.length === 1 ? mk('path', { class: 'area' }, svg) : null;
+    const thr = opts.threshold != null ? mk('line', { class: 'threshold' }, svg) : null;
+    const thrLabel = thr ? mk('text', { class: 'threshold-label', 'text-anchor': 'start' }, svg) : null;
+    const marks = series.map(s => ({
+      ...s,
+      path: mk('path', { class: `line ${s.cls}` }, svg),
+      last: mk('circle', { class: `last ${s.cls}`, r: 4 }, svg),
+      label: mk('text', { class: 'last-label' }, svg),
+    }));
+    const empty = mk('text', { class: 'empty', 'text-anchor': 'middle' }, svg);
+    const cross = mk('line', { class: 'cross', visibility: 'hidden' }, svg);
+    for (const m of marks) m.hDot = mk('circle', { class: `hover-dot ${m.cls}`, r: 4, visibility: 'hidden' }, svg);
+    const hit = mk('rect', { fill: 'transparent' }, svg);
+
+    const ch = { data: Object.fromEntries(series.map(s => [s.key, []])), geo: null };
+    const M = { l: 40, r: 60, t: 8, b: 20 };
+    const H = 160;
+
+    ch.push = (t, v, key = series[0].key) => {
+      const pts = ch.data[key];
+      pts.push({ t, v });
+      const cutoff = t - WINDOW_MS - POLL_MS;
+      while (pts.length && pts[0].t < cutoff) pts.shift();
+    };
+    ch.setThreshold = (v) => { opts.threshold = v; opts.minMax = v * 1.2; };
+    const visible = (key, x0) => ch.data[key].filter(p => p.v != null && p.t >= x0);
+
+    ch.render = (now) => {
+      const W = svg.clientWidth || 400;
+      svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+      const x0 = now - WINDOW_MS;
+      const vals = series.flatMap(s => ch.data[s.key].filter(p => p.v != null).map(p => p.v));
+      const sc = opts.fixedMax ? { step: opts.fixedMax / 4, max: opts.fixedMax }
+                               : niceScale(Math.max(opts.minMax || 1, ...vals) * 1.05, opts.integer);
+      const ymax = sc.max;
+      const X = (t) => M.l + (t - x0) / WINDOW_MS * (W - M.l - M.r);
+      const Y = (v) => H - M.b - (Math.min(v, ymax) / ymax) * (H - M.t - M.b);
+      ch.geo = { X, Y, W, H, x0 };
+
+      gGrid.innerHTML = '';
+      for (let i = 0; i * sc.step <= ymax + 1e-9; i++) {
+        const v = i * sc.step, y = Y(v);
+        if (i > 0) mk('line', { x1: M.l, x2: W - M.r, y1: y, y2: y }, gGrid);
+        const tx = mk('text', { x: M.l - 6, y: y + 3.5, 'text-anchor': 'end' }, gGrid);
+        tx.textContent = opts.fmtAxis(v);
+      }
+      for (let m = 5; m >= 0; m--) {
+        const tx = mk('text', { x: X(now - m * 60000), y: H - 4, 'text-anchor': m === 0 ? 'end' : (m === 5 ? 'start' : 'middle') }, gGrid);
+        tx.textContent = m === 0 ? 'now' : `−${m}m`;
+      }
+      axis.setAttribute('x1', M.l); axis.setAttribute('x2', W - M.r);
+      axis.setAttribute('y1', Y(0)); axis.setAttribute('y2', Y(0));
+
+      if (thr) {
+        const vis = opts.threshold <= ymax;
+        thr.setAttribute('visibility', vis ? 'visible' : 'hidden');
+        thrLabel.setAttribute('visibility', vis ? 'visible' : 'hidden');
+        const y = Y(opts.threshold);
+        thr.setAttribute('x1', M.l); thr.setAttribute('x2', W - M.r);
+        thr.setAttribute('y1', y); thr.setAttribute('y2', y);
+        thrLabel.setAttribute('x', M.l + 4); thrLabel.setAttribute('y', y - 4);  // left: the latest values sit on the right
+        thrLabel.textContent = `threshold ${opts.threshold} ms`;
+      }
+
+      let anyData = false;
+      const labelYs = [];
+      for (const m of marks) {
+        // Line (and, for a lone series, the soft fill under it), broken wherever a reading is missing.
+        let d = '', a = '', seg = [];
+        const closeSeg = () => {
+          if (seg.length) {
+            a += `M${seg[0][0]},${Y(0).toFixed(1)}` + seg.map(([x, y]) => `L${x},${y}`).join('') +
+                 `L${seg[seg.length - 1][0]},${Y(0).toFixed(1)}Z`;
+          }
+          seg = [];
+        };
+        for (const p of ch.data[m.key]) {
+          if (p.v == null || p.t < x0) { closeSeg(); continue; }
+          const x = X(p.t).toFixed(1), y = Y(p.v).toFixed(1);
+          d += `${seg.length ? 'L' : 'M'}${x},${y}`;
+          seg.push([x, y]);
+        }
+        closeSeg();
+        m.path.setAttribute('d', d);
+        if (area) area.setAttribute('d', a);
+
+        const pts = visible(m.key, x0);
+        const lastPt = pts[pts.length - 1];
+        const show = lastPt ? 'visible' : 'hidden';
+        m.last.setAttribute('visibility', show);
+        m.label.setAttribute('visibility', show);
+        if (!lastPt) continue;
+        anyData = true;
+        m.last.setAttribute('cx', X(lastPt.t)); m.last.setAttribute('cy', Y(lastPt.v));
+        // Nudge labels apart when two series end at nearly the same height.
+        let ly = Math.max(M.t + 8, Math.min(H - M.b - 2, Y(lastPt.v) + 3.5));
+        for (const other of labelYs) if (Math.abs(ly - other) < 12) ly = other + (ly <= other ? -12 : 12);
+        labelYs.push(ly);
+        m.label.setAttribute('x', X(lastPt.t) + 8);
+        m.label.setAttribute('y', ly);
+        m.label.textContent = opts.fmt(lastPt.v);
+      }
+      empty.setAttribute('visibility', anyData ? 'hidden' : 'visible');
+      if (!anyData) {
+        empty.setAttribute('x', (M.l + W - M.r) / 2); empty.setAttribute('y', M.t + 18);
+        empty.textContent = opts.emptyText || 'Waiting for data';
+      }
+
+      hit.setAttribute('x', M.l); hit.setAttribute('y', 0);
+      hit.setAttribute('width', Math.max(0, W - M.l - M.r)); hit.setAttribute('height', H);
+      if (ch.hoverX != null) ch.hover(ch.hoverX);
+    };
+
+    ch.hover = (px) => {
+      ch.hoverX = px;
+      const g = ch.geo;
+      const nearest = (pts) => pts.reduce((best, p) =>
+        !best || Math.abs(g.X(p.t) - px) < Math.abs(g.X(best.t) - px) ? p : best, null);
+      const hits = marks.map(m => ({ m, p: nearest(visible(m.key, g.x0)) })).filter(h => h.p);
+      if (!hits.length) return ch.leave();
+      const anchor = hits.reduce((a, h) => Math.abs(g.X(h.p.t) - px) < Math.abs(g.X(a.p.t) - px) ? h : a).p;
+      const x = g.X(anchor.t);
+      cross.setAttribute('x1', x); cross.setAttribute('x2', x);
+      cross.setAttribute('y1', M.t); cross.setAttribute('y2', g.H - M.b);
+      cross.setAttribute('visibility', 'visible');
+      const parts = [clock(anchor.t)];
+      for (const m of marks) {
+        const h = hits.find(h => h.m === m && Math.abs(h.p.t - anchor.t) <= POLL_MS * 1.5);
+        m.hDot.setAttribute('visibility', h ? 'visible' : 'hidden');
+        if (!h) continue;
+        m.hDot.setAttribute('cx', g.X(h.p.t)); m.hDot.setAttribute('cy', g.Y(h.p.v));
+        parts.push(marks.length > 1 ? `${m.short} ${opts.fmt(h.p.v)}` : opts.fmt(h.p.v));
+      }
+      tip.textContent = parts.join('  ');
+      tip.style.display = 'block';
+      const svgBox = svg.getBoundingClientRect(), hostBox = host.getBoundingClientRect();
+      const scale = svgBox.width / g.W;
+      const left = svgBox.left - hostBox.left + x * scale;
+      const tw = tip.offsetWidth;
+      tip.style.left = Math.min(Math.max(4, left - tw / 2), hostBox.width - tw - 4) + 'px';
+      tip.style.top = (svgBox.top - hostBox.top + g.Y(anchor.v) * scale - 30) + 'px';
+    };
+    ch.leave = () => {
+      ch.hoverX = null;
+      cross.setAttribute('visibility', 'hidden');
+      for (const m of marks) m.hDot.setAttribute('visibility', 'hidden');
+      tip.style.display = 'none';
+    };
+    hit.addEventListener('mousemove', (e) => {
+      const r = svg.getBoundingClientRect();
+      ch.hover((e.clientX - r.left) * (ch.geo.W / r.width));
+    });
+    hit.addEventListener('mouseleave', ch.leave);
+    return ch;
+  }
+
+  const fmtPct = (v) => `${v.toFixed(1)}%`;
+  const fmtAxisMs = (v) => v === 0 ? '0' : v >= 1000 ? `${+(v / 1000).toFixed(2)}s` : `${+v.toFixed(1)}`;
+  const fmtMs = (v) => v >= 1000 ? `${(v / 1000).toFixed(2)} s` : `${v.toFixed(v < 10 ? 1 : 0)} ms`;
+  const charts = {
+    cpu:  makeChart('c-cpu',  { title: 'CPU usage', note: '%', fixedMax: 100, fmt: fmtPct, fmtAxis: (v) => v.toFixed(0) }),
+    conn: makeChart('c-conn', { title: 'Active connections', note: 'count', minMax: 4, integer: true, fmt: (v) => v.toFixed(0), fmtAxis: (v) => String(v) }),
+    lag:  makeChart('c-lag',  { title: 'Event-loop lag', note: 'ms', minMax: 10, fmt: fmtMs, fmtAxis: fmtAxisMs }),
+    lat:  makeChart('c-lat',  { title: 'Latency: actual vs forecast', note: 'ms; the forecast leads actual latency by its horizon',
+                                minMax: THRESHOLD_MS * 1.2, threshold: THRESHOLD_MS, fmt: fmtMs, fmtAxis: fmtAxisMs,
+                                emptyText: 'Waiting for traffic. Start the load generator below.',
+                                series: [{ key: 'actual', cls: '', label: 'Actual (server, last 10 s)', short: 'actual' },
+                                         { key: 'pred', cls: 'pred', label: 'Forecast', short: 'forecast' }] }),
+  };
+  const renderAll = () => { const now = Date.now(); for (const k in charts) charts[k].render(now); };
+  window.addEventListener('resize', renderAll);
+
+  // ------------------------------------------------------------- polling
+  let paused = false, polling = false;
+  let predicting = false;
+  const ICONS = {
+    good: '<path d="M5 12.5l4.5 4.5L19 7.5"/>',
+    critical: '<path d="M12 3l9.5 17h-19z"/><path d="M12 10v4.5"/><path d="M12 17.6v.1"/>',
+    idle: '<circle cx="12" cy="12" r="9"/>',
+  };
+
+  function setVerdict(kind, text) {
+    $('f-verdict').className = 'verdict ' + kind;
+    $('f-icon').innerHTML = ICONS[kind];
+    $('f-verdict-text').textContent = text;
+  }
+
+  async function pollPrediction(t) {
+    if (predicting) return;
+    predicting = true;
+    try {
+      const res = await fetch('/prediction', { cache: 'no-store' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const p = await res.json();
+      if (p.threshold_ms && p.threshold_ms !== THRESHOLD_MS) {
+        THRESHOLD_MS = p.threshold_ms;
+        charts.lat.setThreshold(THRESHOLD_MS);
+      }
+      charts.lat.push(t, p.recent_latency_ms, 'actual');
+      $('f-actual').innerHTML = p.recent_latency_ms == null ? '–'
+        : fmtMs(p.recent_latency_ms).replace(/ (m?s)$/, '<small>$1</small>');
+      $('f-actual-sub').textContent = p.recent_requests
+        ? `mean of ${p.recent_requests} /api requests in the last 10 s` : 'no /api requests in the last 10 s';
+      if (!p.available) {
+        charts.lat.push(t, null, 'pred');
+        $('f-source').textContent = 'model: not loaded';
+        $('f-pred').textContent = '–';
+        setVerdict('idle', 'No model loaded');
+        $('f-explain').innerHTML = 'Train a model with <code>scripts/train_on_server.sh</code> (it leaves ' +
+          '<code>model/model.joblib</code> next to the app) or set <code>SAGEMAKER_ENDPOINT_NAME</code>.' +
+          (p.error && !p.error.startsWith('no model') ? `<br>Last error: ${p.error.replace(/</g, '&lt;')}` : '');
+        return;
+      }
+      const horizon = p.horizon_s == null ? null : Math.round(p.horizon_s);
+      charts.lat.push(t, p.predicted_ms, 'pred');
+      $('f-source').textContent = `model: ${p.source}`;
+      $('f-label').textContent = horizon ? `Predicted latency in ${horizon} s` : 'Predicted latency';
+      $('f-pred').innerHTML = fmtMs(p.predicted_ms).replace(/ (m?s)$/, '<small>$1</small>');
+      if (p.would_scale_out) setVerdict('critical', `Above ${p.threshold_ms} ms: scale-out requested if capacity allows`);
+      else setVerdict('good', `Below ${p.threshold_ms} ms: no action needed`);
+      $('f-explain').textContent = `Every 30 s the Lambda sends these readings to the model. A forecast above ` +
+        `${p.threshold_ms} ms requests another EC2 instance if the fleet limit allows it. ` +
+        `The current demo is capped at one instance. Local models can differ from the deployed Lambda endpoint.`;
+    } catch (e) {
+      charts.lat.push(t, null, 'actual'); charts.lat.push(t, null, 'pred');
+      $('f-source').textContent = 'model: unreachable';
+    } finally {
+      predicting = false;
+    }
+  }
+
+  function setState(kind, text) {
+    $('state-dot').className = 'dot ' + kind;
+    $('state-text').textContent = text;
+  }
+
+  async function poll() {
+    if (paused || polling) return;
+    polling = true;
+    const started = performance.now(), t = Date.now();
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), POLL_TIMEOUT_MS);
+    try {
+      const res = await fetch('/metrics', { cache: 'no-store', signal: ctl.signal });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const m = await res.json();
+      const rtt = performance.now() - started;
+      charts.cpu.push(t, m.cpu_usage);
+      charts.conn.push(t, m.active_connections);
+      charts.lag.push(t, m.lag_ms);
+      $('r-cpu').innerHTML = `${m.cpu_usage.toFixed(1)}<small>%</small>`;
+      $('r-conn').textContent = m.active_connections;
+      $('r-lag').innerHTML = `${m.lag_ms.toFixed(1)}<small>ms</small>`;
+      $('r-rtt').innerHTML = rtt >= 1000 ? `${(rtt / 1000).toFixed(2)}<small>s</small>` : `${rtt.toFixed(0)}<small>ms</small>`;
+      $('r-rtt-sub').textContent = rtt > 1000 ? 'slow: the server is struggling to respond' : 'time to answer this poll';
+      if (rtt > 1000) setState('warning', `Live, slow to respond`);
+      else setState('good', 'Live');
+    } catch (e) {
+      charts.cpu.push(t, null); charts.conn.push(t, null); charts.lag.push(t, null);
+      const timedOut = e.name === 'AbortError';
+      $('r-rtt').textContent = timedOut ? '> 5 s' : '–';
+      $('r-rtt-sub').textContent = timedOut ? 'timed out, the watchdog would miss this reading' : 'request failed';
+      setState('critical', timedOut ? 'No response in 5 s' : 'Unreachable');
+    } finally {
+      clearTimeout(timer);
+      polling = false;
+    }
+  }
+
+  function tick() {
+    const t = Date.now();
+    if (!paused) {
+      poll();
+      pollPrediction(t);
+    }
+    renderAll();
+  }
+
+  $('pause').addEventListener('click', () => {
+    paused = !paused;
+    $('pause').textContent = paused ? 'Resume' : 'Pause';
+    if (paused) setState('', 'Paused');
+  });
+
+  // -------------------------------------------------------- load generator
+  let run = null;
+  const intensityEl = $('intensity');
+  const showIntensity = () => { $('intensity-out').textContent = intensityEl.value === '0' ? 'random' : intensityEl.value; };
+  intensityEl.addEventListener('input', showIntensity);
+
+  function pct(sorted, p) {
+    if (!sorted.length) return null;
+    return sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))];
+  }
+
+  function updateStats() {
+    if (!run) return;
+    const s = [...run.latencies].sort((a, b) => a - b);
+    const f = (v) => v == null ? '–' : fmtMs(v);
+    $('s-sent').textContent = run.sent;
+    $('s-ok').textContent = run.ok;
+    $('s-err').textContent = run.err;
+    $('s-p50').textContent = f(pct(s, 0.5));
+    $('s-p95').textContent = f(pct(s, 0.95));
+    $('s-max').textContent = f(s.length ? s[s.length - 1] : null);
+  }
+
+  function logRow(t, intensity, status, ms) {
+    const body = $('log');
+    if (body.querySelector('.empty-row')) body.innerHTML = '';
+    const tr = document.createElement('tr');
+    const slow = ms != null && ms > THRESHOLD_MS;
+    tr.innerHTML = `<td class="mono">${clock(t)}</td><td class="r num">${intensity}</td>` +
+      `<td>${status}</td><td class="r num${slow ? ' slow' : ''}">${ms == null ? '–' : fmtMs(ms)}</td>`;
+    body.prepend(tr);
+    while (body.children.length > LOG_ROWS) body.lastChild.remove();
+  }
+
+  async function worker(r) {
+    while (r === run && !r.stopping && (r.until === 0 || Date.now() < r.until)) {
+      const fixed = Number(intensityEl.value);
+      const intensity = fixed || (1 + Math.floor(Math.random() * 10));
+      r.sent++;
+      const started = performance.now();
+      try {
+        const res = await fetch(`/api/simulate?intensity=${intensity}`, { cache: 'no-store' });
+        await res.text();
+        const ms = performance.now() - started;
+        if (res.ok) { r.ok++; r.latencies.push(ms); }
+        else r.err++;
+        logRow(Date.now(), intensity, res.ok ? '200' : String(res.status), ms);
+      } catch (e) {
+        r.err++;
+        logRow(Date.now(), intensity, 'network error', null);
+      }
+      updateStats();
+    }
+  }
+
+  function setRunning(on, text) {
+    $('start').disabled = on;
+    $('stop').disabled = !on;
+    for (const id of ['concurrency', 'duration']) $(id).disabled = on;
+    $('run-dot').className = 'dot' + (on ? ' good' : '');
+    $('run-text').textContent = text;
+  }
+
+  $('start').addEventListener('click', async () => {
+    const n = Number($('concurrency').value);
+    const secs = Number($('duration').value);
+    const r = { sent: 0, ok: 0, err: 0, latencies: [], stopping: false, until: secs ? Date.now() + secs * 1000 : 0 };
+    run = r;
+    updateStats();
+    setRunning(true, `Running ${n} parallel ${n === 1 ? 'request' : 'requests'}` + (secs ? ` for ${secs >= 60 ? secs / 60 + ' min' : secs + ' s'}` : ' until stopped'));
+    await Promise.all(Array.from({ length: n }, () => worker(r)));
+    if (run === r) {
+      run = null;
+      setRunning(false, `Finished: ${r.ok} completed, ${r.err} errors`);
+    }
+  });
+
+  $('stop').addEventListener('click', () => {
+    if (!run) return;
+    run.stopping = true;
+    $('stop').disabled = true;
+    $('run-text').textContent = 'Stopping, waiting for in-flight requests';
+  });
+
+  renderAll();
+  tick();
+  setInterval(tick, POLL_MS);
+})();
+</script>
+</body>
+</html>
