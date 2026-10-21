@@ -1,0 +1,102 @@
+name: Apply Infra Watchdog UI refresh
+
+on:
+  push:
+    paths:
+      - '.github/workflows/ui-refresh.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  refresh-ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply blue-black dashboard theme
+        shell: python
+        run: |
+          from pathlib import Path
+
+          p = Path('backend/dashboard.html')
+          s = p.read_text()
+          marker = '/* ===== Infra Watchdog 2026 UI refresh: blue + black control-room theme ===== */'
+          css = r'''
+          /* ===== Infra Watchdog 2026 UI refresh: blue + black control-room theme ===== */
+          :root, :root[data-theme="dark"] {
+            color-scheme: dark;
+            --page:#030712; --page-2:#071426; --surface:#08111f; --surface-2:#0b1728;
+            --rule:#17304f; --grid:#10243c; --ink:#f5f9ff; --ink-2:#a9bfd9; --ink-3:#6f8eae;
+            --series:#2f8cff; --series-soft:rgba(47,140,255,.16); --s-actual:#37a2ff; --s-pred:#7c5cff;
+            --good:#20d68f; --warning:#ffb547; --critical:#ff5f6d; --btn-ink:#fff;
+            --shadow:0 1px 0 rgba(255,255,255,.035) inset,0 18px 50px -28px rgba(0,0,0,.9),0 0 0 1px rgba(47,140,255,.025);
+          }
+          :root[data-theme="light"] {
+            color-scheme: light;
+            --page:#eef5ff; --page-2:#dbeafe; --surface:#fff; --surface-2:#f3f7fd;
+            --rule:#bfd3eb; --grid:#dbe8f6; --ink:#071426; --ink-2:#35506d; --ink-3:#6f88a2;
+            --series:#0b6cff; --series-soft:rgba(11,108,255,.12); --s-actual:#0b6cff; --s-pred:#6d4aff;
+            --good:#05865b; --warning:#b96a00; --critical:#d8374c; --btn-ink:#fff;
+            --shadow:0 14px 34px -24px rgba(17,64,120,.32),0 0 0 1px rgba(11,108,255,.04);
+          }
+          body {
+            background:
+              radial-gradient(900px 460px at 88% -6%,rgba(27,111,255,.19),transparent 70%),
+              radial-gradient(700px 420px at -5% 22%,rgba(37,99,235,.10),transparent 72%),
+              linear-gradient(180deg,var(--page),color-mix(in srgb,var(--page) 94%,#071426));
+          }
+          .wrap{max-width:1280px}
+          header{background:color-mix(in srgb,var(--page) 78%,transparent);border-bottom:1px solid color-mix(in srgb,var(--series) 22%,var(--rule));box-shadow:0 8px 40px -30px rgba(37,139,255,.6)}
+          header .wrap{min-height:68px}
+          .logo{width:38px;height:38px;border-radius:12px;background:linear-gradient(145deg,#1479ff,#0951bb 62%,#042b65);box-shadow:0 0 24px rgba(47,140,255,.25),inset 0 1px 0 rgba(255,255,255,.20)}
+          .brand-name{font-family:var(--sans);font-size:18px;font-weight:700;letter-spacing:-.025em}
+          .host,.state{background:rgba(9,21,38,.72);border-color:color-mix(in srgb,var(--series) 24%,var(--rule))}
+          .hero{padding:44px 0 14px}
+          .hero h1{font-family:var(--sans);font-weight:750;letter-spacing:-.04em;font-size:clamp(34px,4.8vw,54px);background:linear-gradient(100deg,var(--ink) 20%,#62aaff 72%,#8fc5ff);-webkit-background-clip:text;background-clip:text;color:transparent}
+          .hero p{font-size:15px;line-height:1.75;max-width:760px}
+          .pipeline{gap:8px;margin-top:18px}
+          .pipeline span{background:linear-gradient(180deg,rgba(19,48,84,.72),rgba(8,24,43,.75));border-color:rgba(61,145,255,.25);color:var(--ink-2)}
+          .panel{background:linear-gradient(180deg,color-mix(in srgb,var(--surface) 96%,#0d2340),var(--surface));border-color:color-mix(in srgb,var(--series) 18%,var(--rule));box-shadow:var(--shadow)}
+          .readouts{gap:16px}.readout{padding:19px 20px 17px}.readout::before{width:2px;background:linear-gradient(var(--series),#6d4aff);opacity:1}
+          .readout .label,.forecast .label{font-weight:700;letter-spacing:.085em}.readout .value{font-size:34px;letter-spacing:-.04em}
+          .chart{padding:18px 18px 12px}.chart svg{height:175px}.chart .line{stroke-width:2.35}
+          .forecast{overflow:hidden}.forecast>div{padding:23px 24px}.forecast .big{font-size:44px;letter-spacing:-.045em}
+          .verdict{border-radius:999px;padding:7px 13px;background:color-mix(in srgb,var(--surface-2) 85%,transparent)}
+          button,select{border-radius:10px;padding:8px 13px;background:linear-gradient(180deg,var(--surface-2),var(--surface));border-color:color-mix(in srgb,var(--series) 20%,var(--rule))}
+          button:hover,select:hover{border-color:var(--series);box-shadow:0 0 0 3px color-mix(in srgb,var(--series) 11%,transparent)}
+          button.primary{background:linear-gradient(135deg,#1677ff,#075dcc);border-color:#2d8cff;box-shadow:0 8px 24px -14px rgba(32,127,255,.9),inset 0 1px 0 rgba(255,255,255,.18)}
+          button.primary:hover{filter:brightness(1.08);opacity:1}
+          .controls{background:linear-gradient(180deg,color-mix(in srgb,var(--surface-2) 96%,#102a4c),var(--surface-2))}
+          .stats .stat,.stat{background:color-mix(in srgb,var(--surface-2) 74%,transparent);border-color:color-mix(in srgb,var(--series) 14%,var(--rule))}
+          table thead th{background:color-mix(in srgb,var(--surface-2) 88%,#0d2c53);color:var(--ink-2)}
+          footer{border-top-color:color-mix(in srgb,var(--series) 16%,var(--rule));background:rgba(3,7,18,.55)}
+          @media(max-width:760px){.hero{padding-top:30px}.hero h1{font-size:36px}.readout .value{font-size:29px}}
+          '''
+
+          if marker not in s:
+              s = s.replace('</style>', css + '\n</style>', 1)
+          s = s.replace("t === 'dark' ? 'Beige' : 'Dark brown'", "t === 'dark' ? 'Light' : 'Dark'")
+          p.write_text(s)
+
+      - name: Validate dashboard structure
+        shell: python
+        run: |
+          from pathlib import Path
+          s=Path('backend/dashboard.html').read_text()
+          required=['id="m-cpu"','id="m-active"','id="m-lag"','id="m-latency"','id="forecast"','id="start"','id="stop"','/metrics','/prediction']
+          missing=[x for x in required if x not in s]
+          if missing:
+              raise SystemExit(f'Missing dashboard hooks: {missing}')
+          print('Dashboard hooks preserved; UI-only refresh validated.')
+
+      - name: Commit refreshed dashboard
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend/dashboard.html
+          git diff --cached --quiet && exit 0
+          git commit -m "Refresh Infra Watchdog dashboard with blue-black UI"
+          git push
