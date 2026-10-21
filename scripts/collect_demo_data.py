@@ -1,15 +1,9 @@
-"""
-Collect real server load data for a demo model, without Locust.
+"""Collect varied, repeatable load cycles for Infra Watchdog validation.
 
-Runs repeated load cycles against /api/simulate: quiet, a gradual ramp up to
---peak parallel clients, a short hold, a ramp down, quiet again. Gradual
-ramps matter: the model forecasts latency 30 s ahead (ml/train.py), so it
-needs to see load building up before latency degrades, not just jumps.
-Several cycles give compare_scaling.py more than one slowdown to score.
-
-Run it on the app server (or anywhere that can reach it):
-    python3 scripts/collect_demo_data.py --cycles 3
-which takes about 8 minutes per cycle with the defaults.
+The ideal review requires evidence across many unseen load shapes and at least
+10 slowdown events. This generator can run gradual ramps, sudden spikes, long
+holds and bursty mixes. Use --profile all --cycles 12 for a research-quality
+campaign, then split the resulting CSV by cycle/run before walk-forward tests.
 """
 import argparse
 import random
@@ -18,26 +12,35 @@ import time
 import urllib.request
 
 
-def load_profile(t: float, ramp_s: float, hold_s: float, quiet_s: float, peak: int) -> int:
-    """Parallel clients wanted at `t` seconds into one cycle."""
-    if t < quiet_s:
+def wanted_clients(profile, t, cycle_s, peak):
+    x = t / cycle_s
+    if profile == "ramp":
+        if x < .12: return 1
+        if x < .55: return 1 + round((peak - 1) * (x - .12) / .43)
+        if x < .72: return peak
+        if x < .90: return max(1, round(peak * (1 - (x - .72) / .18)))
         return 1
-    t -= quiet_s
-    if t < ramp_s:
-        return 1 + round((peak - 1) * t / ramp_s)
-    t -= ramp_s
-    if t < hold_s:
-        return peak
-    t -= hold_s
-    if t < ramp_s / 2:
-        return max(1, round(peak * (1 - t / (ramp_s / 2))))
-    return 1
+    if profile == "spike":
+        if x < .25: return 1
+        if x < .55: return peak
+        if x < .65: return max(1, peak // 3)
+        if x < .82: return peak
+        return 1
+    if profile == "hold":
+        if x < .15: return 1
+        if x < .35: return 1 + round((peak - 1) * (x - .15) / .20)
+        if x < .82: return peak
+        return 1
+    # mixed: several smaller surges with a rising baseline.
+    base = max(1, round(1 + (peak * .35) * x))
+    burst = peak if (.22 < x < .31 or .53 < x < .63 or .76 < x < .88) else base
+    return min(peak, max(1, burst))
 
 
-def worker(index: int, wanted: list, stop: threading.Event, host: str, counts: list) -> None:
+def worker(index, wanted, stop, host, counts):
     while not stop.is_set():
         if index >= wanted[0]:
-            time.sleep(0.2)
+            time.sleep(0.15)
             continue
         try:
             intensity = random.randint(1, 10)
@@ -45,21 +48,23 @@ def worker(index: int, wanted: list, stop: threading.Event, host: str, counts: l
                 r.read()
             counts[index] += 1
         except Exception:
-            time.sleep(0.5)
-        time.sleep(random.uniform(0.02, 0.2))  # think time, like Locust's wait_time
+            time.sleep(0.35)
+        time.sleep(random.uniform(0.02, 0.18))
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="http://127.0.0.1:8000")
-    parser.add_argument("--cycles", type=int, default=3)
-    parser.add_argument("--peak", type=int, default=24, help="parallel clients at the top of each ramp")
-    parser.add_argument("--ramp-s", type=float, default=240)
-    parser.add_argument("--hold-s", type=float, default=60)
-    parser.add_argument("--quiet-s", type=float, default=60)
-    args = parser.parse_args()
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--host", default="http://127.0.0.1:8000")
+    p.add_argument("--cycles", type=int, default=3,
+                   help="Use 12 or more for the ideal-version evidence campaign")
+    p.add_argument("--peak", type=int, default=24)
+    p.add_argument("--cycle-s", type=float, default=480)
+    p.add_argument("--profile", choices=["ramp", "spike", "hold", "mixed", "all"], default="ramp")
+    p.add_argument("--seed", type=int, default=42)
+    args = p.parse_args()
+    random.seed(args.seed)
 
-    cycle_s = args.quiet_s + args.ramp_s + args.hold_s + args.ramp_s / 2 + args.quiet_s
+    profiles = ["ramp", "spike", "hold", "mixed"] if args.profile == "all" else [args.profile]
     wanted = [1]
     counts = [0] * args.peak
     stop = threading.Event()
@@ -69,13 +74,19 @@ def main() -> None:
         th.start()
 
     start = time.monotonic()
-    total_s = cycle_s * args.cycles
-    print(f"{args.cycles} cycles of {cycle_s / 60:.1f} min against {args.host}", flush=True)
+    total_s = args.cycle_s * args.cycles
+    print(f"campaign: {args.cycles} cycles x {args.cycle_s/60:.1f} min against {args.host}", flush=True)
     try:
+        last_report = -1
         while (elapsed := time.monotonic() - start) < total_s:
-            wanted[0] = load_profile(elapsed % cycle_s, args.ramp_s, args.hold_s, args.quiet_s, args.peak)
-            if int(elapsed) % 15 == 0:
-                print(f"t={elapsed:5.0f}s clients={wanted[0]:2d} requests={sum(counts)}", flush=True)
+            cycle = int(elapsed // args.cycle_s)
+            cycle_t = elapsed % args.cycle_s
+            profile = profiles[cycle % len(profiles)]
+            wanted[0] = wanted_clients(profile, cycle_t, args.cycle_s, args.peak)
+            sec = int(elapsed)
+            if sec // 15 != last_report:
+                last_report = sec // 15
+                print(f"cycle={cycle+1:02d}/{args.cycles} profile={profile:<5} t={cycle_t:5.0f}s clients={wanted[0]:2d} requests={sum(counts)}", flush=True)
             time.sleep(1)
     finally:
         stop.set()
