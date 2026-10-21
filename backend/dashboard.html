@@ -240,6 +240,10 @@
     .readouts { gap: 10px; }
     .readout .value { font-size: 24px; }
   }
+
+/* ---- live servers ---- */
+.servers-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:12px}.server-kpi{padding:15px 17px}.server-kpi .label{font-size:11px;color:var(--ink-2);text-transform:uppercase;letter-spacing:.07em}.server-kpi .value{font-size:27px;font-weight:650;margin-top:5px}.server-kpi .sub{color:var(--ink-3);font-size:11px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.server-list{overflow:hidden}.server-list table{width:100%;border-collapse:collapse}.server-list th,.server-list td{padding:11px 14px;text-align:left;border-bottom:1px solid var(--rule)}.server-list th{color:var(--ink-2);font-size:11px;text-transform:uppercase;letter-spacing:.06em;font-weight:500}.server-health{display:inline-flex;align-items:center;gap:7px}.server-health i{width:7px;height:7px;border-radius:50%;background:var(--good);box-shadow:0 0 0 3px color-mix(in srgb,var(--good) 18%,transparent)}.server-health.bad i{background:var(--critical);box-shadow:none}.server-empty{text-align:center!important;color:var(--ink-3);padding:22px!important}@media(max-width:800px){.servers-summary{grid-template-columns:repeat(2,1fr)}.server-list{overflow-x:auto}}
+
 </style>
 </head>
 <body>
@@ -335,6 +339,17 @@
   </section>
 
   <section>
+    <div class="section-head"><h2>Live servers</h2><span class="note" id="servers-note">actual Auto Scaling fleet · refreshing every 5 s</span></div>
+    <div class="servers-summary">
+      <div class="panel server-kpi"><div class="label">Live servers</div><div class="value num" id="servers-total">–</div><div class="sub" id="servers-asg">loading fleet</div></div>
+      <div class="panel server-kpi"><div class="label">Desired capacity</div><div class="value num" id="servers-desired">–</div><div class="sub" id="servers-range">Auto Scaling target</div></div>
+      <div class="panel server-kpi"><div class="label">Healthy</div><div class="value num" id="servers-healthy">–</div><div class="sub">InService + healthy</div></div>
+      <div class="panel server-kpi"><div class="label">Last scaling event</div><div class="value" id="servers-event" style="font-size:16px;margin-top:10px">–</div><div class="sub" id="servers-event-time">waiting for AWS</div></div>
+    </div>
+    <div class="panel server-list"><table><thead><tr><th>Instance ID</th><th>Status</th><th>Availability Zone</th><th>CPU</th><th>Connections</th><th>Recent latency</th></tr></thead><tbody id="servers-body"><tr><td colspan="6" class="server-empty">Loading live AWS servers…</td></tr></tbody></table></div>
+  </section>
+
+  <section>
     <div class="section-head"><h2>Load generator</h2><span class="note">sends traffic to /api/simulate</span></div>
     <div class="panel loadgen">
       <div class="controls">
@@ -375,9 +390,6 @@
         <div class="stats">
           <div class="stat"><div class="label">Sent</div><div class="value num" id="s-sent">0</div></div>
           <div class="stat"><div class="label">Completed</div><div class="value num" id="s-ok">0</div></div>
-          <div class="stat"><div class="label">Errors</div><div class="value num" id="s-err">0</div></div>
-          <div class="stat"><div class="label">p50</div><div class="value num" id="s-p50">–</div></div>
-          <div class="stat"><div class="label">p95</div><div class="value num" id="s-p95">–</div></div>
           <div class="stat"><div class="label">Max</div><div class="value num" id="s-max">–</div></div>
         </div>
         <div class="runline"><span class="dot" id="run-dot"></span><span id="run-text">Idle</span></div>
@@ -753,6 +765,12 @@
     if (paused) setState('', 'Paused');
   });
 
+
+// ---------------------------------------------------------- live servers
+let serversLoading=false;
+function compactScaleEvent(text){if(!text)return'No recent event';const l=text.toLowerCase();if(l.includes('launch'))return'Scale out';if(l.includes('terminat'))return'Scale in';return text.length>42?text.slice(0,39)+'…':text;}
+async function refreshServers(){if(serversLoading)return;serversLoading=true;try{const res=await fetch('/api/servers',{cache:'no-store'});if(!res.ok)throw new Error(`HTTP ${res.status}`);const data=await res.json();$('servers-total').textContent=data.total_servers??'–';$('servers-desired').textContent=data.desired_capacity??'–';$('servers-healthy').textContent=data.healthy_servers??'–';$('servers-asg').textContent=data.asg_name||'Auto Scaling Group';$('servers-range').textContent=`range ${data.min_size??'–'}–${data.max_size??'–'} instances`;const ev=data.last_scale_event;$('servers-event').textContent=compactScaleEvent(ev&&ev.description);$('servers-event-time').textContent=ev&&ev.start_time?new Date(ev.start_time).toLocaleString():'no recent AWS scaling activity';const rows=data.servers||[],body=$('servers-body');body.innerHTML=rows.length?rows.map(v=>{const good=String(v.status).toLowerCase()==='healthy';const cpu=v.cpu_usage==null?'–':`${Number(v.cpu_usage).toFixed(1)}%`;const conn=v.active_connections==null?'–':v.active_connections;const lat=v.recent_latency_ms==null?'–':`${Number(v.recent_latency_ms).toFixed(0)} ms`;return `<tr><td class="mono">${v.instance_id}</td><td><span class="server-health${good?'':' bad'}"><i></i>${v.status}</span></td><td class="mono">${v.az||'–'}</td><td class="num">${cpu}</td><td class="num">${conn}</td><td class="num">${lat}</td></tr>`}).join(''):'<tr><td colspan="6" class="server-empty">No live instances are currently in the scaling fleet.</td></tr>';$('servers-note').textContent=`actual Auto Scaling fleet · ${rows.length} instance${rows.length===1?'':'s'} · refreshed now`;}catch(e){$('servers-note').textContent='live AWS fleet unavailable — retrying';$('servers-body').innerHTML='<tr><td colspan="6" class="server-empty">Unable to read live server state right now.</td></tr>';}finally{serversLoading=false;}}
+
   // -------------------------------------------------------- load generator
   let run = null;
   const intensityEl = $('intensity');
@@ -770,9 +788,6 @@
     const f = (v) => v == null ? '–' : fmtMs(v);
     $('s-sent').textContent = run.sent;
     $('s-ok').textContent = run.ok;
-    $('s-err').textContent = run.err;
-    $('s-p50').textContent = f(pct(s, 0.5));
-    $('s-p95').textContent = f(pct(s, 0.95));
     $('s-max').textContent = f(s.length ? s[s.length - 1] : null);
   }
 
@@ -839,7 +854,9 @@
 
   renderAll();
   tick();
+  refreshServers();
   setInterval(tick, POLL_MS);
+  setInterval(refreshServers, 5000);
 })();
 </script>
 </body>

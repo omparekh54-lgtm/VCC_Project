@@ -399,3 +399,60 @@ async def simulate(request: Request, intensity: int = 1):
     intensity = max(1, min(intensity, 10))
     result = await anyio.to_thread.run_sync(_burn_cpu, intensity, limiter=request.app.state.cpu_limiter)
     return JSONResponse({"result": result})
+
+
+# ---- live server inventory for dashboard ----
+SERVER_ASG_NAME = os.getenv('SERVER_ASG_NAME', 'infra-watchdog-ideal-asg')
+SERVER_METRIC_NAMESPACE = os.getenv('SERVER_METRIC_NAMESPACE', 'InfraWatchdog/App')
+
+def _server_inventory_sync():
+    import boto3
+    region = os.getenv('AWS_DEFAULT_REGION') or os.getenv('AWS_REGION') or 'ap-south-1'
+    autoscaling = boto3.client('autoscaling', region_name=region)
+    ec2 = boto3.client('ec2', region_name=region)
+    cloudwatch = boto3.client('cloudwatch', region_name=region)
+    groups = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[SERVER_ASG_NAME]).get('AutoScalingGroups', [])
+    if not groups:
+        return {'asg_name': SERVER_ASG_NAME, 'total_servers': 0, 'desired_capacity': 0, 'healthy_servers': 0, 'min_size': 0, 'max_size': 0, 'last_scale_event': None, 'servers': []}
+    group = groups[0]
+    fleet = group.get('Instances', [])
+    ids = [x['InstanceId'] for x in fleet]
+    meta = {}
+    if ids:
+        for reservation in ec2.describe_instances(InstanceIds=ids).get('Reservations', []):
+            for instance in reservation.get('Instances', []):
+                meta[instance['InstanceId']] = instance
+    latest = {iid: {} for iid in ids}
+    if ids:
+        defs = {'cpu_usage': ('CPUUsage','Percent'), 'active_connections': ('ActiveConnections','Count'), 'recent_latency_ms': ('RecentLatencyMs','Milliseconds')}
+        queries=[]; qmap={}; n=0
+        for iid in ids:
+            for field,(metric,unit) in defs.items():
+                qid=f'm{n}'; n+=1; qmap[qid]=(iid,field)
+                queries.append({'Id':qid,'MetricStat':{'Metric':{'Namespace':SERVER_METRIC_NAMESPACE,'MetricName':metric,'Dimensions':[{'Name':'InstanceId','Value':iid}]},'Period':60,'Stat':'Average','Unit':unit},'ReturnData':True})
+        try:
+            now=time.time()
+            data=cloudwatch.get_metric_data(MetricDataQueries=queries,StartTime=now-180,EndTime=now,ScanBy='TimestampDescending',MaxDatapoints=max(100,len(queries)*5))
+            for result in data.get('MetricDataResults', []):
+                target=qmap.get(result.get('Id')); vals=result.get('Values', [])
+                if target and vals:
+                    iid,field=target; latest[iid][field]=float(vals[0])
+        except Exception as exc:
+            print(f'server metric lookup failed: {type(exc).__name__}: {exc}')
+    activities=autoscaling.describe_scaling_activities(AutoScalingGroupName=SERVER_ASG_NAME,MaxRecords=10).get('Activities',[])
+    last_event=None
+    if activities:
+        a=activities[0]; last_event={'description':a.get('Description'),'cause':a.get('Cause'),'status':a.get('StatusCode'),'start_time':a.get('StartTime').isoformat() if a.get('StartTime') else None}
+    servers=[]
+    for item in fleet:
+        iid=item['InstanceId']; m=latest.get(iid,{}); im=meta.get(iid,{})
+        healthy=item.get('HealthStatus')=='Healthy' and item.get('LifecycleState')=='InService'
+        servers.append({'instance_id':iid,'status':'Healthy' if healthy else item.get('HealthStatus','Unknown'),'lifecycle_state':item.get('LifecycleState','Unknown'),'az':im.get('Placement',{}).get('AvailabilityZone',item.get('AvailabilityZone','-')),'instance_type':im.get('InstanceType',item.get('InstanceType','-')),'cpu_usage':round(m['cpu_usage'],1) if 'cpu_usage' in m else None,'active_connections':round(m['active_connections']) if 'active_connections' in m else None,'recent_latency_ms':round(m['recent_latency_ms'],1) if 'recent_latency_ms' in m else None})
+    return {'asg_name':SERVER_ASG_NAME,'total_servers':len(servers),'desired_capacity':group.get('DesiredCapacity',0),'healthy_servers':sum(1 for s in servers if s['status']=='Healthy'),'min_size':group.get('MinSize',0),'max_size':group.get('MaxSize',0),'last_scale_event':last_event,'servers':servers}
+
+@app.get('/api/servers')
+async def live_servers():
+    try:
+        return await run_in_threadpool(_server_inventory_sync)
+    except Exception as exc:
+        return JSONResponse({'error':f'{type(exc).__name__}: {exc}','asg_name':SERVER_ASG_NAME,'total_servers':0,'desired_capacity':0,'healthy_servers':0,'servers':[]},status_code=503)
