@@ -1,0 +1,420 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Infra Watchdog ideal architecture: public ALB, private multi-AZ EC2 fleet,
+  HTTPS option, CloudWatch-driven prediction, native EC2 Auto Scaling policies,
+  least-purpose IAM and conservative scale-in. This is intentionally separate
+  from the low-cost demo stack so it can be reviewed and enabled deliberately.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two public subnets in different Availability Zones for the ALB.
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two private subnets in different AZs; they need outbound access or a pre-baked AMI.
+  ArtifactBucketName:
+    Type: String
+    Description: Existing bucket containing app/app.py, app/requirements.txt and app/dashboard.html.
+  SageMakerEndpointName:
+    Type: String
+    Default: infra-watchdog-endpoint
+  ForecasterCodeBucket:
+    Type: String
+    Description: S3 bucket containing a zip with lambda/ideal_forecaster.py as lambda_function.py.
+  ForecasterCodeKey:
+    Type: String
+    Description: S3 key for the forecaster Lambda deployment zip.
+  InstanceType:
+    Type: String
+    Default: t3.small
+  MinCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 2
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 2
+  MaxCapacity:
+    Type: Number
+    Default: 4
+    MinValue: 2
+  AppPort:
+    Type: Number
+    Default: 8000
+  LatencyThresholdMs:
+    Type: Number
+    Default: 500
+  BreachProbabilityThreshold:
+    Type: Number
+    Default: 0.70
+  ScaleInProbabilityThreshold:
+    Type: Number
+    Default: 0.15
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: Optional ACM certificate ARN. When set, port 80 redirects to HTTPS/443.
+
+Conditions:
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, '']]
+
+Resources:
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Infra Watchdog app - only ALB may reach the application port
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref AppPort
+          ToPort: !Ref AppPort
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Tags:
+        - Key: Project
+          Value: VCC_Project
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public entry point for Infra Watchdog
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - !If
+          - HasCertificate
+          - IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            CidrIp: 0.0.0.0/0
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: VCC_Project
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: infra-watchdog-alb
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      Subnets: !Ref PublicSubnetIds
+      Tags:
+        - Key: Project
+          Value: VCC_Project
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: infra-watchdog-app
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: !Ref AppPort
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '60'
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - !If
+          - HasCertificate
+          - Type: redirect
+            RedirectConfig:
+              Protocol: HTTPS
+              Port: '443'
+              StatusCode: HTTP_301
+          - Type: forward
+            TargetGroupArn: !Ref TargetGroup
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCertificate
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: InfraWatchdogAppAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${ArtifactBucketName}/app/*
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: InfraWatchdog/App
+
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref AppRole]
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: infra-watchdog-ideal-app
+      LaunchTemplateData:
+        ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Name: !Ref AppInstanceProfile
+        SecurityGroupIds: [!Ref AppSecurityGroup]
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+        CreditSpecification:
+          CpuCredits: standard
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euo pipefail
+            dnf install -y python3-pip awscli
+            mkdir -p /opt/infra-watchdog
+            cd /opt/infra-watchdog
+            aws s3 cp s3://${ArtifactBucketName}/app/app.py .
+            aws s3 cp s3://${ArtifactBucketName}/app/requirements.txt .
+            aws s3 cp s3://${ArtifactBucketName}/app/dashboard.html . || true
+            python3 -m venv venv
+            ./venv/bin/pip install -r requirements.txt
+            TOKEN=$(curl -fsS -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' http://169.254.169.254/latest/api/token)
+            IID=$(curl -fsS -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+            cat >/etc/systemd/system/infra-watchdog.service <<EOF
+            [Unit]
+            Description=Infra Watchdog FastAPI backend
+            After=network-online.target
+            [Service]
+            WorkingDirectory=/opt/infra-watchdog
+            Environment=INSTANCE_ID=$IID
+            Environment=PUSH_CLOUDWATCH=true
+            Environment=CLOUDWATCH_INTERVAL_S=10
+            Environment=LATENCY_THRESHOLD_MS=${LatencyThresholdMs}
+            ExecStart=/opt/infra-watchdog/venv/bin/uvicorn app:app --host 0.0.0.0 --port ${AppPort}
+            Restart=always
+            RestartSec=5
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            systemctl daemon-reload
+            systemctl enable --now infra-watchdog.service
+
+  AppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: infra-watchdog-ideal-asg
+      MinSize: !Ref MinCapacity
+      DesiredCapacity: !Ref DesiredCapacity
+      MaxSize: !Ref MaxCapacity
+      VPCZoneIdentifier: !Ref PrivateSubnetIds
+      TargetGroupARNs: [!Ref TargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 180
+      Cooldown: 120
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: infra-watchdog-ideal-app
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: VCC_Project
+          PropagateAtLaunch: true
+
+  ScaleOutPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AppAutoScalingGroup
+      PolicyType: SimpleScaling
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: 1
+      Cooldown: 120
+
+  ScaleInPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AppAutoScalingGroup
+      PolicyType: SimpleScaling
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: -1
+      Cooldown: 600
+
+  ForecastBreachAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: infra-watchdog-predictive-scale-out
+      Namespace: InfraWatchdog
+      MetricName: BreachProbability
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: !Ref BreachProbabilityThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref ScaleOutPolicy]
+
+  ForecastHealthyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: infra-watchdog-conservative-scale-in
+      Namespace: InfraWatchdog
+      MetricName: BreachProbability
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 5
+      Threshold: !Ref ScaleInProbabilityThreshold
+      ComparisonOperator: LessThanOrEqualToThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref ScaleInPolicy]
+
+  MetricsUnreachableAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: infra-watchdog-metrics-unreachable
+      Namespace: InfraWatchdog
+      MetricName: MetricsUnreachable
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  ForecasterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: ForecastPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:ListMetrics
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action: sagemaker:InvokeEndpoint
+                Resource: !Sub arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${SageMakerEndpointName}
+
+  ForecasterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Egress-only SG for ideal forecaster Lambda
+      VpcId: !Ref VpcId
+
+  IdealForecaster:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: infra-watchdog-ideal-forecaster
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Timeout: 45
+      MemorySize: 256
+      Role: !GetAtt ForecasterRole.Arn
+      Code:
+        S3Bucket: !Ref ForecasterCodeBucket
+        S3Key: !Ref ForecasterCodeKey
+      VpcConfig:
+        SecurityGroupIds: [!Ref ForecasterSecurityGroup]
+        SubnetIds: !Ref PrivateSubnetIds
+      Environment:
+        Variables:
+          SAGEMAKER_ENDPOINT_NAME: !Ref SageMakerEndpointName
+          LATENCY_THRESHOLD_MS: !Ref LatencyThresholdMs
+          FALLBACK_CPU_THRESHOLD: '70'
+
+  ForecastSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: infra-watchdog-ideal-forecast-schedule
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt IdealForecaster.Arn
+          Id: ForecastLambda
+
+  ForecastSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IdealForecaster
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ForecastSchedule.Arn
+
+  OperationsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: InfraWatchdog-Ideal
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"region":"${AWS::Region}","title":"Forecast vs actual","metrics":[["InfraWatchdog","PredictedLatencyMs"],[".","PredictedP90LatencyMs"],[".","ActualLatencyMs"]],"period":60,"stat":"Maximum","yAxis":{"left":{"min":0}}}},
+            {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"region":"${AWS::Region}","title":"Breach probability","metrics":[["InfraWatchdog","BreachProbability"]],"period":60,"stat":"Maximum","yAxis":{"left":{"min":0,"max":1}}}},
+            {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"region":"${AWS::Region}","title":"Fleet health","metrics":[["AWS/AutoScaling","GroupInServiceInstances","AutoScalingGroupName","${AppAutoScalingGroup}"],["AWS/AutoScaling","GroupDesiredCapacity","AutoScalingGroupName","${AppAutoScalingGroup}"]],"period":60,"stat":"Average"}},
+            {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"region":"${AWS::Region}","title":"Guardrail health","metrics":[["InfraWatchdog","MetricsUnreachable"],[".","FallbackUsed"]],"period":60,"stat":"Maximum"}}
+          ]
+        }
+
+Outputs:
+  LoadBalancerDnsName:
+    Value: !GetAtt LoadBalancer.DNSName
+  AutoScalingGroupName:
+    Value: !Ref AppAutoScalingGroup
+  DashboardName:
+    Value: !Ref OperationsDashboard
+  HttpsEnabled:
+    Value: !If [HasCertificate, 'true', 'false']
