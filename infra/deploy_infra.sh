@@ -1,12 +1,7 @@
 #!/bin/bash
-# Deploys the persistent infra (S3, EC2 ASG, Lambda, EventBridge rule) and
-# uploads the app code to the newly created bucket. Run from the infra/ dir.
-#
-# Usage:
-#   ./deploy_infra.sh <vpc-id> <subnet-id-1,subnet-id-2,...> [region]
-#
-# Existing instances need the in-place updater after this upload completes.
-
+# Deploys the cost-safe demo infrastructure and then synchronizes the current
+# app/ML/Lambda source from the repository. The production-grade alternative
+# is deploy_ideal.sh + cloudformation_ideal.yaml.
 set -euo pipefail
 
 VPC_ID="${1:?Usage: deploy_infra.sh <vpc-id> <subnet-ids-comma-separated> [region]}"
@@ -25,20 +20,36 @@ aws cloudformation deploy \
 
 BUCKET=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
   --query "Stacks[0].Outputs[?OutputKey=='MetricsBucketName'].OutputValue" --output text)
+LAMBDA_NAME=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='ScalingGuardrailFunctionName'].OutputValue" --output text)
 
-echo ">> Uploading backend/ app code to s3://$BUCKET/app/ ..."
+echo ">> Uploading backend app to s3://$BUCKET/app/ ..."
 aws s3 cp ../backend/app.py "s3://$BUCKET/app/app.py" --region "$REGION"
 aws s3 cp ../backend/requirements.txt "s3://$BUCKET/app/requirements.txt" --region "$REGION"
 aws s3 cp ../backend/dashboard.html "s3://$BUCKET/app/dashboard.html" --region "$REGION"
 
-echo ">> Uploading server-side helper scripts and ML code ..."
-for f in collect_demo_data.py train_on_server.sh upload_metrics_to_s3.py update_app_on_server.sh; do
-  aws s3 cp "../scripts/$f" "s3://$BUCKET/app/scripts/$f" --region "$REGION"
+echo ">> Uploading server-side helper scripts ..."
+for f in collect_demo_data.py train_on_server.sh upload_metrics_to_s3.py upload_metrics_to_firehose.py update_app_on_server.sh run_real_scaleout_test.sh; do
+  [[ -f "../scripts/$f" ]] && aws s3 cp "../scripts/$f" "s3://$BUCKET/app/scripts/$f" --region "$REGION"
 done
-aws s3 cp ../ml/train.py "s3://$BUCKET/ml/train.py" --region "$REGION"
-aws s3 cp ../ml/inference.py "s3://$BUCKET/ml/inference.py" --region "$REGION"
+
+echo ">> Uploading ML code ..."
+for f in train.py train_ideal.py inference.py compare_scaling.py deploy_endpoint.py launch_training_job.py pipeline.py evaluate_meta.py build_drift_baseline.py; do
+  [[ -f "../ml/$f" ]] && aws s3 cp "../ml/$f" "s3://$BUCKET/ml/$f" --region "$REGION"
+done
+
+echo ">> Updating the live guardrail Lambda from lambda/lambda_function.py ..."
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
+cp ../lambda/lambda_function.py "$TMP_DIR/lambda_function.py"
+(cd "$TMP_DIR" && zip -q guardrail.zip lambda_function.py)
+aws lambda update-function-code \
+  --function-name "$LAMBDA_NAME" \
+  --zip-file "fileb://$TMP_DIR/guardrail.zip" \
+  --region "$REGION" >/dev/null
+aws lambda wait function-updated --function-name "$LAMBDA_NAME" --region "$REGION"
 
 echo ">> Done. Bucket: $BUCKET"
-echo ">> A NEW instance picks these files up when it boots. An instance that is"
-echo "   already running keeps its old code until you run, on it:"
+echo ">> New EC2 instances pick up the uploaded app automatically."
+echo ">> Existing EC2 instances still need the in-place updater:"
 echo "   sudo bash /opt/infra-watchdog/scripts/update_app_on_server.sh $BUCKET --region $REGION"

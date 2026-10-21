@@ -1,0 +1,127 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Infra Watchdog ideal training-data lake - Firehose DirectPut to partitioned Parquet in S3.
+
+Parameters:
+  MetricsBucketName:
+    Type: String
+    Description: Existing Infra Watchdog S3 bucket.
+
+Resources:
+  MetricsDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: infra_watchdog
+
+  MetricsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref MetricsDatabase
+      TableInput:
+        Name: request_metrics
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+        StorageDescriptor:
+          Columns:
+            - {Name: timestamp, Type: double}
+            - {Name: cpu_usage, Type: double}
+            - {Name: active_connections, Type: double}
+            - {Name: lag_ms, Type: double}
+            - {Name: response_time_ms, Type: double}
+            - {Name: instance_count, Type: double}
+          Location: !Sub s3://${MetricsBucketName}/data/parquet/
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: firehose.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DeliveryAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${MetricsBucketName}
+                  - !Sub arn:${AWS::Partition}:s3:::${MetricsBucketName}/*
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetTableVersion
+                  - glue:GetTableVersions
+                Resource: '*'
+              - Effect: Allow
+                Action: logs:PutLogEvents
+                Resource: !GetAtt FirehoseLogStream.Arn
+
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/kinesisfirehose/infra-watchdog-metrics
+      RetentionInDays: 14
+
+  FirehoseLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref FirehoseLogGroup
+      LogStreamName: S3Delivery
+
+  MetricsDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: infra-watchdog-metrics
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !Sub arn:${AWS::Partition}:s3:::${MetricsBucketName}
+        RoleARN: !GetAtt FirehoseRole.Arn
+        Prefix: data/parquet/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/
+        ErrorOutputPrefix: data/firehose-errors/!{firehose:error-output-type}/
+        BufferingHints:
+          IntervalInSeconds: 300
+          SizeInMBs: 64
+        CompressionFormat: UNCOMPRESSED
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref FirehoseLogGroup
+          LogStreamName: !Ref FirehoseLogStream
+        DataFormatConversionConfiguration:
+          Enabled: true
+          InputFormatConfiguration:
+            Deserializer:
+              OpenXJsonSerDe: {}
+          OutputFormatConfiguration:
+            Serializer:
+              ParquetSerDe:
+                Compression: SNAPPY
+          SchemaConfiguration:
+            CatalogId: !Ref AWS::AccountId
+            DatabaseName: !Ref MetricsDatabase
+            Region: !Ref AWS::Region
+            RoleARN: !GetAtt FirehoseRole.Arn
+            TableName: !Ref MetricsTable
+            VersionId: LATEST
+
+Outputs:
+  DeliveryStreamName:
+    Value: !Ref MetricsDeliveryStream
+  ParquetPrefix:
+    Value: !Sub s3://${MetricsBucketName}/data/parquet/
