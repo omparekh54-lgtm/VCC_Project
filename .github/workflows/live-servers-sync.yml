@@ -1,0 +1,142 @@
+name: Sync live servers UI
+
+on:
+  push:
+    paths:
+      - '.github/workflows/live-servers-sync.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Patch backend and dashboard
+        shell: python
+        run: |
+          from pathlib import Path
+
+          app_p = Path('backend/app.py')
+          dash_p = Path('backend/dashboard.html')
+          app = app_p.read_text()
+          dash = dash_p.read_text()
+
+          if "@app.get('/api/servers')" not in app and '@app.get("/api/servers")' not in app:
+              app += r'''
+
+          # ---- live server inventory for dashboard ----
+          SERVER_ASG_NAME = os.getenv('SERVER_ASG_NAME', 'infra-watchdog-ideal-asg')
+          SERVER_METRIC_NAMESPACE = os.getenv('SERVER_METRIC_NAMESPACE', 'InfraWatchdog/App')
+
+          def _server_inventory_sync():
+              import boto3
+              region = os.getenv('AWS_DEFAULT_REGION') or os.getenv('AWS_REGION') or 'ap-south-1'
+              autoscaling = boto3.client('autoscaling', region_name=region)
+              ec2 = boto3.client('ec2', region_name=region)
+              cloudwatch = boto3.client('cloudwatch', region_name=region)
+              groups = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[SERVER_ASG_NAME]).get('AutoScalingGroups', [])
+              if not groups:
+                  return {'asg_name': SERVER_ASG_NAME, 'total_servers': 0, 'desired_capacity': 0, 'healthy_servers': 0, 'min_size': 0, 'max_size': 0, 'last_scale_event': None, 'servers': []}
+              group = groups[0]
+              fleet = group.get('Instances', [])
+              ids = [x['InstanceId'] for x in fleet]
+              meta = {}
+              if ids:
+                  for reservation in ec2.describe_instances(InstanceIds=ids).get('Reservations', []):
+                      for instance in reservation.get('Instances', []):
+                          meta[instance['InstanceId']] = instance
+              latest = {iid: {} for iid in ids}
+              if ids:
+                  defs = {'cpu_usage': ('CPUUsage','Percent'), 'active_connections': ('ActiveConnections','Count'), 'recent_latency_ms': ('RecentLatencyMs','Milliseconds')}
+                  queries=[]; qmap={}; n=0
+                  for iid in ids:
+                      for field,(metric,unit) in defs.items():
+                          qid=f'm{n}'; n+=1; qmap[qid]=(iid,field)
+                          queries.append({'Id':qid,'MetricStat':{'Metric':{'Namespace':SERVER_METRIC_NAMESPACE,'MetricName':metric,'Dimensions':[{'Name':'InstanceId','Value':iid}]},'Period':60,'Stat':'Average','Unit':unit},'ReturnData':True})
+                  try:
+                      now=time.time()
+                      data=cloudwatch.get_metric_data(MetricDataQueries=queries,StartTime=now-180,EndTime=now,ScanBy='TimestampDescending',MaxDatapoints=max(100,len(queries)*5))
+                      for result in data.get('MetricDataResults', []):
+                          target=qmap.get(result.get('Id')); vals=result.get('Values', [])
+                          if target and vals:
+                              iid,field=target; latest[iid][field]=float(vals[0])
+                  except Exception as exc:
+                      print(f'server metric lookup failed: {type(exc).__name__}: {exc}')
+              activities=autoscaling.describe_scaling_activities(AutoScalingGroupName=SERVER_ASG_NAME,MaxRecords=10).get('Activities',[])
+              last_event=None
+              if activities:
+                  a=activities[0]; last_event={'description':a.get('Description'),'cause':a.get('Cause'),'status':a.get('StatusCode'),'start_time':a.get('StartTime').isoformat() if a.get('StartTime') else None}
+              servers=[]
+              for item in fleet:
+                  iid=item['InstanceId']; m=latest.get(iid,{}); im=meta.get(iid,{})
+                  healthy=item.get('HealthStatus')=='Healthy' and item.get('LifecycleState')=='InService'
+                  servers.append({'instance_id':iid,'status':'Healthy' if healthy else item.get('HealthStatus','Unknown'),'lifecycle_state':item.get('LifecycleState','Unknown'),'az':im.get('Placement',{}).get('AvailabilityZone',item.get('AvailabilityZone','-')),'instance_type':im.get('InstanceType',item.get('InstanceType','-')),'cpu_usage':round(m['cpu_usage'],1) if 'cpu_usage' in m else None,'active_connections':round(m['active_connections']) if 'active_connections' in m else None,'recent_latency_ms':round(m['recent_latency_ms'],1) if 'recent_latency_ms' in m else None})
+              return {'asg_name':SERVER_ASG_NAME,'total_servers':len(servers),'desired_capacity':group.get('DesiredCapacity',0),'healthy_servers':sum(1 for s in servers if s['status']=='Healthy'),'min_size':group.get('MinSize',0),'max_size':group.get('MaxSize',0),'last_scale_event':last_event,'servers':servers}
+
+          @app.get('/api/servers')
+          async def live_servers():
+              try:
+                  return await run_in_threadpool(_server_inventory_sync)
+              except Exception as exc:
+                  return JSONResponse({'error':f'{type(exc).__name__}: {exc}','asg_name':SERVER_ASG_NAME,'total_servers':0,'desired_capacity':0,'healthy_servers':0,'servers':[]},status_code=503)
+          '''
+
+          if '/* ---- live servers ---- */' not in dash:
+              css = r'''
+          /* ---- live servers ---- */
+          .servers-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:12px}.server-kpi{padding:15px 17px}.server-kpi .label{font-size:11px;color:var(--ink-2);text-transform:uppercase;letter-spacing:.07em}.server-kpi .value{font-size:27px;font-weight:650;margin-top:5px}.server-kpi .sub{color:var(--ink-3);font-size:11px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.server-list{overflow:hidden}.server-list table{width:100%;border-collapse:collapse}.server-list th,.server-list td{padding:11px 14px;text-align:left;border-bottom:1px solid var(--rule)}.server-list th{color:var(--ink-2);font-size:11px;text-transform:uppercase;letter-spacing:.06em;font-weight:500}.server-health{display:inline-flex;align-items:center;gap:7px}.server-health i{width:7px;height:7px;border-radius:50%;background:var(--good);box-shadow:0 0 0 3px color-mix(in srgb,var(--good) 18%,transparent)}.server-health.bad i{background:var(--critical);box-shadow:none}.server-empty{text-align:center!important;color:var(--ink-3);padding:22px!important}@media(max-width:800px){.servers-summary{grid-template-columns:repeat(2,1fr)}.server-list{overflow-x:auto}}
+          '''
+              dash = dash.replace('</style>', css + '\n</style>', 1)
+
+          if 'id="servers-body"' not in dash:
+              html = '''  <section>\n    <div class="section-head"><h2>Live servers</h2><span class="note" id="servers-note">actual Auto Scaling fleet · refreshing every 5 s</span></div>\n    <div class="servers-summary">\n      <div class="panel server-kpi"><div class="label">Live servers</div><div class="value num" id="servers-total">–</div><div class="sub" id="servers-asg">loading fleet</div></div>\n      <div class="panel server-kpi"><div class="label">Desired capacity</div><div class="value num" id="servers-desired">–</div><div class="sub" id="servers-range">Auto Scaling target</div></div>\n      <div class="panel server-kpi"><div class="label">Healthy</div><div class="value num" id="servers-healthy">–</div><div class="sub">InService + healthy</div></div>\n      <div class="panel server-kpi"><div class="label">Last scaling event</div><div class="value" id="servers-event" style="font-size:16px;margin-top:10px">–</div><div class="sub" id="servers-event-time">waiting for AWS</div></div>\n    </div>\n    <div class="panel server-list"><table><thead><tr><th>Instance ID</th><th>Status</th><th>Availability Zone</th><th>CPU</th><th>Connections</th><th>Recent latency</th></tr></thead><tbody id="servers-body"><tr><td colspan="6" class="server-empty">Loading live AWS servers…</td></tr></tbody></table></div>\n  </section>\n\n'''
+              marker='  <section>\n    <div class="section-head"><h2>Load generator</h2>'
+              dash = dash.replace(marker, html + marker, 1)
+
+          for snippet in [
+              '          <div class="stat"><div class="label">Errors</div><div class="value num" id="s-err">0</div></div>\n',
+              '          <div class="stat"><div class="label">p50</div><div class="value num" id="s-p50">–</div></div>\n',
+              '          <div class="stat"><div class="label">p95</div><div class="value num" id="s-p95">–</div></div>\n']:
+              dash = dash.replace(snippet, '')
+          dash = dash.replace("    $('s-err').textContent = run.err;\n", '').replace("    $('s-p50').textContent = f(pct(s, 0.5));\n", '').replace("    $('s-p95').textContent = f(pct(s, 0.95));\n", '')
+
+          if 'async function refreshServers()' not in dash:
+              js = r'''
+          // ---------------------------------------------------------- live servers
+          let serversLoading=false;
+          function compactScaleEvent(text){if(!text)return'No recent event';const l=text.toLowerCase();if(l.includes('launch'))return'Scale out';if(l.includes('terminat'))return'Scale in';return text.length>42?text.slice(0,39)+'…':text;}
+          async function refreshServers(){if(serversLoading)return;serversLoading=true;try{const res=await fetch('/api/servers',{cache:'no-store'});if(!res.ok)throw new Error(`HTTP ${res.status}`);const data=await res.json();$('servers-total').textContent=data.total_servers??'–';$('servers-desired').textContent=data.desired_capacity??'–';$('servers-healthy').textContent=data.healthy_servers??'–';$('servers-asg').textContent=data.asg_name||'Auto Scaling Group';$('servers-range').textContent=`range ${data.min_size??'–'}–${data.max_size??'–'} instances`;const ev=data.last_scale_event;$('servers-event').textContent=compactScaleEvent(ev&&ev.description);$('servers-event-time').textContent=ev&&ev.start_time?new Date(ev.start_time).toLocaleString():'no recent AWS scaling activity';const rows=data.servers||[],body=$('servers-body');body.innerHTML=rows.length?rows.map(v=>{const good=String(v.status).toLowerCase()==='healthy';const cpu=v.cpu_usage==null?'–':`${Number(v.cpu_usage).toFixed(1)}%`;const conn=v.active_connections==null?'–':v.active_connections;const lat=v.recent_latency_ms==null?'–':`${Number(v.recent_latency_ms).toFixed(0)} ms`;return `<tr><td class="mono">${v.instance_id}</td><td><span class="server-health${good?'':' bad'}"><i></i>${v.status}</span></td><td class="mono">${v.az||'–'}</td><td class="num">${cpu}</td><td class="num">${conn}</td><td class="num">${lat}</td></tr>`}).join(''):'<tr><td colspan="6" class="server-empty">No live instances are currently in the scaling fleet.</td></tr>';$('servers-note').textContent=`actual Auto Scaling fleet · ${rows.length} instance${rows.length===1?'':'s'} · refreshed now`;}catch(e){$('servers-note').textContent='live AWS fleet unavailable — retrying';$('servers-body').innerHTML='<tr><td colspan="6" class="server-empty">Unable to read live server state right now.</td></tr>';}finally{serversLoading=false;}}
+          '''
+              dash = dash.replace('  // -------------------------------------------------------- load generator', js + '\n  // -------------------------------------------------------- load generator', 1)
+              dash = dash.replace('  renderAll();\n  tick();\n  setInterval(tick, POLL_MS);', '  renderAll();\n  tick();\n  refreshServers();\n  setInterval(tick, POLL_MS);\n  setInterval(refreshServers, 5000);', 1)
+
+          app_p.write_text(app)
+          dash_p.write_text(dash)
+
+      - name: Validate
+        shell: python
+        run: |
+          import ast
+          from pathlib import Path
+          ast.parse(Path('backend/app.py').read_text())
+          s=Path('backend/dashboard.html').read_text()
+          required=['id="servers-body"','refreshServers','id="start"','id="stop"','/api/servers']
+          missing=[x for x in required if x not in s and x not in Path('backend/app.py').read_text()]
+          if missing: raise SystemExit(f'Missing: {missing}')
+          for removed in ['id="s-p50"','id="s-p95"','id="s-err"']:
+              if removed in s: raise SystemExit(f'Still present: {removed}')
+
+      - name: Commit source sync
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend/app.py backend/dashboard.html
+          git diff --cached --quiet && exit 0
+          git commit -m "Add live servers panel and simplify load stats"
+          git push
