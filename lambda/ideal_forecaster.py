@@ -7,7 +7,9 @@ endpoint, and publishes PredictedLatencyMs / BreachProbability. Native EC2
 Auto Scaling policies can then act on those CloudWatch metrics.
 
 If inference fails, it publishes a conservative rule-based fallback decision
-from current latency / CPU so scaling is never blind.
+from current latency / CPU so scaling is never blind. Idle fleets are explicitly
+suppressed so an old or biased point model cannot scale when there is no business
+traffic.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -69,9 +71,6 @@ def aggregate_features():
         else:
             features[feature_name] = max(vals)
 
-    # Trend features are emitted by the app in /metrics for the demo guardrail.
-    # In the CloudWatch-driven production path they can be zero until dedicated
-    # app-side trend metrics are enabled; ideal models accept them safely.
     features.update({
         "cpu_delta_15s": 0.0,
         "cpu_delta_30s": 0.0,
@@ -108,16 +107,33 @@ def publish(name, value, unit):
 def lambda_handler(event, context):
     features = aggregate_features()
     fallback = False
-    try:
-        predicted, p90, probability = invoke_model(features)
-    except (ClientError, BotoCoreError, KeyError, ValueError, TypeError) as exc:
+    idle = (
+        features.get("active_connections", 0) <= 0
+        and features.get("recent_latency_ms", 0) <= 0
+        and features.get("request_rate_rps", 0) <= 0
+    )
+
+    if features.get("instance_count", 0) <= 0:
+        predicted = p90 = 0.0
+        probability = 1.0
         fallback = True
-        predicted = max(features["recent_latency_ms"], features["recent_p95_latency_ms"])
-        p90 = predicted
-        probability = 1.0 if (
-            predicted > LATENCY_THRESHOLD_MS or features["cpu_usage"] > CPU_THRESHOLD
-        ) else 0.0
-        print(f"model fallback: {type(exc).__name__}: {exc}")
+        publish("MetricsUnreachable", 1, "Count")
+    elif idle:
+        predicted = p90 = 0.0
+        probability = 0.0
+        publish("MetricsUnreachable", 0, "Count")
+    else:
+        publish("MetricsUnreachable", 0, "Count")
+        try:
+            predicted, p90, probability = invoke_model(features)
+        except (ClientError, BotoCoreError, KeyError, ValueError, TypeError) as exc:
+            fallback = True
+            predicted = max(features["recent_latency_ms"], features["recent_p95_latency_ms"])
+            p90 = predicted
+            probability = 1.0 if (
+                predicted > LATENCY_THRESHOLD_MS or features["cpu_usage"] > CPU_THRESHOLD
+            ) else 0.0
+            print(f"model fallback: {type(exc).__name__}: {exc}")
 
     publish("PredictedLatencyMs", predicted, "Milliseconds")
     publish("PredictedP90LatencyMs", p90, "Milliseconds")
