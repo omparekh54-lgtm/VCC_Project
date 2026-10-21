@@ -32,7 +32,7 @@ Resources:
             - {Name: lag_ms, Type: double}
             - {Name: response_time_ms, Type: double}
             - {Name: instance_count, Type: double}
-          Location: !Sub s3://${MetricsBucketName}/data/parquet/
+          Location: !Sub 's3://${MetricsBucketName}/data/parquet/'
           InputFormat: org.apache.hadoop.mapred.TextInputFormat
           OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
           SerdeInfo:
@@ -61,8 +61,8 @@ Resources:
                   - s3:ListBucketMultipartUploads
                   - s3:PutObject
                 Resource:
-                  - !Sub arn:${AWS::Partition}:s3:::${MetricsBucketName}
-                  - !Sub arn:${AWS::Partition}:s3:::${MetricsBucketName}/*
+                  - !Sub 'arn:${AWS::Partition}:s3:::${MetricsBucketName}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${MetricsBucketName}/*'
               - Effect: Allow
                 Action:
                   - glue:GetTable
@@ -71,7 +71,7 @@ Resources:
                 Resource: '*'
               - Effect: Allow
                 Action: logs:PutLogEvents
-                Resource: !GetAtt FirehoseLogStream.Arn
+                Resource: '*'
 
   FirehoseLogGroup:
     Type: AWS::Logs::LogGroup
@@ -91,10 +91,10 @@ Resources:
       DeliveryStreamName: infra-watchdog-metrics
       DeliveryStreamType: DirectPut
       ExtendedS3DestinationConfiguration:
-        BucketARN: !Sub arn:${AWS::Partition}:s3:::${MetricsBucketName}
+        BucketARN: !Sub 'arn:${AWS::Partition}:s3:::${MetricsBucketName}'
         RoleARN: !GetAtt FirehoseRole.Arn
-        Prefix: data/parquet/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/
-        ErrorOutputPrefix: data/firehose-errors/!{firehose:error-output-type}/
+        Prefix: 'data/parquet/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/'
+        ErrorOutputPrefix: 'data/firehose-errors/!{firehose:error-output-type}/'
         BufferingHints:
           IntervalInSeconds: 300
           SizeInMBs: 64
@@ -124,4 +124,4 @@ Outputs:
   DeliveryStreamName:
     Value: !Ref MetricsDeliveryStream
   ParquetPrefix:
-    Value: !Sub s3://${MetricsBucketName}/data/parquet/
+    Value: !Sub 's3://${MetricsBucketName}/data/parquet/'
