@@ -1,0 +1,153 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Infra Watchdog ML operations - weekly retraining, drift monitoring and missed-breach checks.
+
+Parameters:
+  MetricsBucketName:
+    Type: String
+  PipelineName:
+    Type: String
+    Default: InfraWatchdogWeeklyRetraining
+  LambdaCodeBucket:
+    Type: String
+  DriftMonitorCodeKey:
+    Type: String
+  PipelineStarterCodeKey:
+    Type: String
+  BaselineKey:
+    Type: String
+    Default: ml/drift_baseline.json
+
+Resources:
+  MlOpsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: MlOpsPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:ListMetrics
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${MetricsBucketName}/${BaselineKey}
+              - Effect: Allow
+                Action: sagemaker:StartPipelineExecution
+                Resource: !Sub arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:pipeline/${PipelineName}
+
+  DriftMonitor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: infra-watchdog-drift-monitor
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Timeout: 120
+      MemorySize: 256
+      Role: !GetAtt MlOpsRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref DriftMonitorCodeKey
+      Environment:
+        Variables:
+          BASELINE_BUCKET: !Ref MetricsBucketName
+          BASELINE_KEY: !Ref BaselineKey
+          PIPELINE_NAME: !Ref PipelineName
+          DRIFT_THRESHOLD: '3.0'
+          LATENCY_THRESHOLD_MS: '500'
+          PROBABILITY_THRESHOLD: '0.70'
+
+  PipelineStarter:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: infra-watchdog-weekly-retrain
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt MlOpsRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref PipelineStarterCodeKey
+      Environment:
+        Variables:
+          PIPELINE_NAME: !Ref PipelineName
+
+  DriftSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: infra-watchdog-drift-check
+      ScheduleExpression: rate(15 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DriftMonitor.Arn
+          Id: DriftMonitor
+
+  DriftPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DriftMonitor
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DriftSchedule.Arn
+
+  WeeklyRetrainingSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: infra-watchdog-weekly-retraining
+      ScheduleExpression: cron(0 2 ? * SUN *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt PipelineStarter.Arn
+          Id: WeeklyPipelineStarter
+
+  WeeklyPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PipelineStarter
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WeeklyRetrainingSchedule.Arn
+
+  FeatureDriftAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: infra-watchdog-feature-drift
+      Namespace: InfraWatchdog
+      MetricName: FeatureDriftScore
+      Statistic: Maximum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  MissedBreachAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: infra-watchdog-missed-breach
+      Namespace: InfraWatchdog
+      MetricName: MissedBreach
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  DriftMonitorName:
+    Value: !Ref DriftMonitor
+  WeeklyRetrainingRule:
+    Value: !Ref WeeklyRetrainingSchedule
