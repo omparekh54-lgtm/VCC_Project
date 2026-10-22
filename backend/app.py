@@ -380,7 +380,7 @@ class _ForecastCalibrator:
         if stable:
             actual = float(recent_ms)
             blended = 0.75 * actual + 0.25 * corrected
-            tolerance = max(25.0, 0.15 * max(actual, 1.0))
+            tolerance = max(15.0, 0.05 * max(actual, 1.0))
             corrected = max(actual - tolerance, min(actual + tolerance, blended))
         self.history.append((now, float(raw_predicted)))
         return round(corrected, 3), round(self.bias_ms, 3), stable
