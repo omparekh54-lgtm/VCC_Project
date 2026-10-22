@@ -344,6 +344,51 @@ class _Predictor:
 predictor = _Predictor()
 
 
+# ---- online forecast calibration ----
+class _ForecastCalibrator:
+    """Online bias correction for the 30 s model forecast.
+
+    Raw model output is preserved. Once a forecast is old enough to compare
+    with observed latency, an EWMA bias is learned. Under stable traffic the
+    displayed forecast is gently anchored toward current measured latency;
+    during changing load the model keeps more influence.
+    """
+    def __init__(self):
+        self.history = collections.deque(maxlen=240)
+        self.bias_ms = 0.0
+        self.samples = 0
+        self.alpha = float(os.getenv("FORECAST_CALIBRATION_ALPHA", "0.25"))
+
+    def calibrate(self, raw_predicted, recent_ms, recent_n, features, horizon_s):
+        now = time.time()
+        horizon = float(horizon_s or 30.0)
+        while self.history and now - self.history[0][0] >= horizon:
+            _, old_pred = self.history.popleft()
+            if recent_ms is not None and recent_n > 0:
+                err = float(recent_ms) - float(old_pred)
+                err = max(-400.0, min(400.0, err))
+                self.bias_ms = (1.0 - self.alpha) * self.bias_ms + self.alpha * err
+                self.samples += 1
+        corrected = max(0.0, float(raw_predicted) + self.bias_ms)
+        has_recent = recent_ms is not None and recent_n > 0
+        stable = (
+            has_recent
+            and abs(float(features.get("cpu_delta_15s", 0.0))) < 12.0
+            and abs(float(features.get("connections_delta_15s", 0.0))) <= 1.0
+            and abs(float(features.get("lag_delta_15s", 0.0))) < 8.0
+        )
+        if stable:
+            actual = float(recent_ms)
+            blended = 0.75 * actual + 0.25 * corrected
+            tolerance = max(25.0, 0.15 * max(actual, 1.0))
+            corrected = max(actual - tolerance, min(actual + tolerance, blended))
+        self.history.append((now, float(raw_predicted)))
+        return round(corrected, 3), round(self.bias_ms, 3), stable
+
+
+forecast_calibrator = _ForecastCalibrator()
+
+
 @app.get("/prediction")
 async def prediction():
     features = _current_features()
@@ -352,6 +397,9 @@ async def prediction():
         "available": False,
         "source": None,
         "predicted_ms": None,
+        "raw_predicted_ms": None,
+        "calibration_bias_ms": None,
+        "forecast_stable_traffic": None,
         "p50_ms": None,
         "p90_ms": None,
         "breach_probability": None,
@@ -372,11 +420,17 @@ async def prediction():
         body["error"] = f"{type(exc).__name__}: {exc}"[:300]
     else:
         has_traffic = features["active_connections"] > 0 or features["recent_latency_ms"] > 0 or features["request_rate_rps"] > 0
-        decision = probability >= 0.70 if probability is not None else predicted > LATENCY_THRESHOLD_MS
+        calibrated, calibration_bias, stable_traffic = forecast_calibrator.calibrate(
+            predicted, recent_ms, recent_n, features, horizon_s
+        )
+        decision = probability >= 0.70 if probability is not None else calibrated > LATENCY_THRESHOLD_MS
         body.update(
             available=True,
             source=source,
-            predicted_ms=predicted,
+            predicted_ms=calibrated,
+            raw_predicted_ms=predicted,
+            calibration_bias_ms=calibration_bias,
+            forecast_stable_traffic=stable_traffic,
             p50_ms=p50,
             p90_ms=p90,
             breach_probability=probability,
