@@ -1,0 +1,49 @@
+name: Add forecast calibration
+
+on:
+  push:
+    paths:
+      - '.github/workflows/forecast-calibration.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Patch prediction calibration
+        shell: python
+        run: |
+          from pathlib import Path
+          p=Path('backend/app.py')
+          s=p.read_text()
+          marker='# ---- online forecast calibration ----'
+          if marker in s:
+              print('already patched')
+              raise SystemExit(0)
+          anchor='predictor = _Predictor()\n\n\n@app.get("/prediction")'
+          block='''predictor = _Predictor()\n\n\n# ---- online forecast calibration ----\nclass _ForecastCalibrator:\n    \"\"\"Online bias correction for the 30 s model forecast.\n\n    Raw model output is preserved. Once a forecast is old enough to compare\n    with observed latency, an EWMA bias is learned. Under stable traffic the\n    displayed forecast is gently anchored toward current measured latency;\n    during changing load the model keeps more influence.\n    \"\"\"\n    def __init__(self):\n        self.history = collections.deque(maxlen=240)\n        self.bias_ms = 0.0\n        self.samples = 0\n        self.alpha = float(os.getenv("FORECAST_CALIBRATION_ALPHA", "0.25"))\n\n    def calibrate(self, raw_predicted, recent_ms, recent_n, features, horizon_s):\n        now = time.time()\n        horizon = float(horizon_s or 30.0)\n        while self.history and now - self.history[0][0] >= horizon:\n            _, old_pred = self.history.popleft()\n            if recent_ms is not None and recent_n > 0:\n                err = float(recent_ms) - float(old_pred)\n                err = max(-400.0, min(400.0, err))\n                self.bias_ms = (1.0 - self.alpha) * self.bias_ms + self.alpha * err\n                self.samples += 1\n        corrected = max(0.0, float(raw_predicted) + self.bias_ms)\n        has_recent = recent_ms is not None and recent_n > 0\n        stable = (\n            has_recent\n            and abs(float(features.get("cpu_delta_15s", 0.0))) < 12.0\n            and abs(float(features.get("connections_delta_15s", 0.0))) <= 1.0\n            and abs(float(features.get("lag_delta_15s", 0.0))) < 8.0\n        )\n        if stable:\n            actual = float(recent_ms)\n            blended = 0.75 * actual + 0.25 * corrected\n            tolerance = max(25.0, 0.15 * max(actual, 1.0))\n            corrected = max(actual - tolerance, min(actual + tolerance, blended))\n        self.history.append((now, float(raw_predicted)))\n        return round(corrected, 3), round(self.bias_ms, 3), stable\n\n\nforecast_calibrator = _ForecastCalibrator()\n\n\n@app.get("/prediction")'''
+          if anchor not in s:
+              raise SystemExit('prediction anchor not found')
+          s=s.replace(anchor, block, 1)
+          s=s.replace('"predicted_ms": None,\n        "p50_ms": None,', '"predicted_ms": None,\n        "raw_predicted_ms": None,\n        "calibration_bias_ms": None,\n        "forecast_stable_traffic": None,\n        "p50_ms": None,', 1)
+          old='''        decision = probability >= 0.70 if probability is not None else predicted > LATENCY_THRESHOLD_MS\n        body.update(\n            available=True,\n            source=source,\n            predicted_ms=predicted,\n            p50_ms=p50,'''
+          new='''        calibrated, calibration_bias, stable_traffic = forecast_calibrator.calibrate(\n            predicted, recent_ms, recent_n, features, horizon_s\n        )\n        decision = probability >= 0.70 if probability is not None else calibrated > LATENCY_THRESHOLD_MS\n        body.update(\n            available=True,\n            source=source,\n            predicted_ms=calibrated,\n            raw_predicted_ms=predicted,\n            calibration_bias_ms=calibration_bias,\n            forecast_stable_traffic=stable_traffic,\n            p50_ms=p50,'''
+          if old not in s:
+              raise SystemExit('body update anchor not found')
+          s=s.replace(old,new,1)
+          p.write_text(s)
+      - name: Validate
+        run: python -m py_compile backend/app.py
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend/app.py
+          git diff --cached --quiet && exit 0
+          git commit -m "Calibrate forecast against recent observed latency"
+          git push
