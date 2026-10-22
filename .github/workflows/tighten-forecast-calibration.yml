@@ -1,0 +1,40 @@
+name: Tighten forecast calibration
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tighten-forecast-calibration.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tighten stable-traffic tolerance
+        shell: python
+        run: |
+          from pathlib import Path
+          p=Path('backend/app.py')
+          s=p.read_text()
+          old='tolerance = max(25.0, 0.15 * max(actual, 1.0))'
+          new='tolerance = max(15.0, 0.05 * max(actual, 1.0))'
+          if old in s:
+              s=s.replace(old,new,1)
+          elif new not in s:
+              raise SystemExit('calibration tolerance anchor missing')
+          p.write_text(s)
+      - name: Validate
+        run: python -m py_compile backend/app.py
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend/app.py
+          git diff --cached --quiet && exit 0
+          git commit -m "Tighten stable forecast calibration tolerance"
+          git push
